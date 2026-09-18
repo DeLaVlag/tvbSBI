@@ -1,0 +1,63 @@
+# Linux x86_64 / CPython 3.12. These direct pins come from the successful
+# native Booster module list where it supplied a package version. The exact
+# `sbi`, MNE, tqdm and transitive versions still need the promised `pip freeze`.
+# See README.md before using a checkpoint from another environment.
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+
+# Direct runtime dependencies of the active SBI/EEG paths.
+# The native module reports PyTorch 2.5.1; cu124 is the official CUDA-12 wheel
+# selected for this image. Confirm the module's precise CUDA build with freeze.
+torch==2.5.1+cu124
+sbi==0.26.1
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.2
+pycuda==2025.1
+mpi4py==4.0.1
+mne==1.12.1
+matplotlib==3.9.2
+numba==0.60.0
+tqdm==4.66.4
+networkx==3.3
+sympy==1.13.1
+
+# Stable SBI runtime dependencies measured in the audited image. CUDA-12
+# dependencies are resolved by the official cu124 Torch index; the previous
+# local image's CUDA-13 pins must not be mixed into this stack.
+absl-py==2.4.0
+certifi==2026.6.17
+charset-normalizer==3.4.7
+joblib==1.5.3
+nflows==0.14
+packaging==26.2
+pillow==10.4.0
+platformdirs==4.10.0
+protobuf==7.35.1
+Mako==1.3.5
+pybind11==2.12.0
+pytools==2026.1.1
+requests==2.34.2
+siphash24==1.8
+six==1.17.0
+skorch==1.4.0
+tabulate==0.10.0
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
+threadpoolctl==3.6.0
+typing-extensions==4.15.0
+urllib3==2.7.0
+werkzeug==3.1.8
+zuko==1.6.0
+
+# Build support. The compiler and headers remain in the image because PyCUDA
+# compiles project kernels at runtime. mpi4py is source-built against image MPI.
+# setuptools 59.6.0 came from the Python-3.10 audit image and cannot expose a
+# working setuptools.build_meta backend under the native Python 3.12 target.
+setuptools==75.6.0
+wheel==0.45.1
+pip==25.2
+build==1.3.0
+pyproject-hooks==1.2.0
+tomli==2.2.1
+Cython==3.0.10

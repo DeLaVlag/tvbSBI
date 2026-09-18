@@ -1,0 +1,67 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+%labels
+    org.opencontainers.image.title TVB-GPU SBI software environment
+    org.opencontainers.image.description Host-mounted source and data; CUDA-12 SBI environment
+
+%files
+    containers/requirements.txt /opt/sbi-container/requirements.txt
+    containers/smoke_test.py /opt/sbi-container/smoke_test.py
+    containers/capture_environment.py /opt/sbi-container/capture_environment.py
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates python3.12 python3.12-dev python3.12-venv \
+        build-essential openmpi-bin libopenmpi-dev libgomp1 fonts-dejavu-core
+    rm -rf /var/lib/apt/lists/*
+
+    python3.12 -m venv /opt/sbi
+    export PATH="/opt/sbi/bin:/usr/local/cuda/bin:${PATH}"
+    export PYTHONNOUSERSITE=1
+    export PIP_NO_CACHE_DIR=1
+    requirements=/opt/sbi-container/requirements.txt
+    # Bootstrap from the SAME pins before disabling build isolation. This
+    # prevents source builds from downloading an unpinned second NumPy, etc.
+    python -m pip install --index-url https://pypi.org/simple \
+        -c "$requirements" pip setuptools wheel build pyproject-hooks tomli numpy Cython
+    # Compile mpi4py against this image's Open MPI, not a wheel's other MPI.
+    export MPICC=/usr/bin/mpicc
+    python -m pip install --no-build-isolation --no-binary=pycuda,mpi4py \
+        -r "$requirements"
+    python -m pip check
+
+    # Record what the build actually installed (OS security revisions can move).
+    python -m pip freeze --all > /opt/sbi-container/pip-freeze.txt
+    dpkg-query -W > /opt/sbi-container/dpkg-packages.txt
+    nvcc --version > /opt/sbi-container/nvcc-version.txt
+    python /opt/sbi-container/capture_environment.py \
+        --output /opt/sbi-container/build-environment.json
+
+%environment
+    export PATH="/opt/sbi/bin:/usr/local/cuda/bin:${PATH}"
+    export PYTHONNOUSERSITE=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export MPLBACKEND=Agg
+    # MNE imports Numba-jitted helpers.  The image's site-packages is
+    # read-only at runtime, so put Numba's compiled cache in the job's
+    # writable temporary filesystem instead of disabling JIT globally.
+    export NUMBA_CACHE_DIR="/tmp/numba_cache_${USER:-apptainer}"
+
+%test
+    # No repository, data, NVIDIA driver or GPU is required at build time.
+    mkdir -p /tmp/sbi-smoke-mpl
+    NUMBA_DISABLE_JIT=1 MPLCONFIGDIR=/tmp/sbi-smoke-mpl \
+        /opt/sbi/bin/python /opt/sbi-container/smoke_test.py --environment-only --cpu
+
+%runscript
+    exec /opt/sbi/bin/python "$@"
+
+%help
+    Environment only. Build from the repository root:
+      apptainer build --fakeroot sbi.sif containers/sbi.def
+    Source and data are external; see containers/README.md for clean bind mounts,
+    CPU/GPU smoke tests, driver requirements and single-rank Slurm examples.

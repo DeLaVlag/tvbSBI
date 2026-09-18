@@ -1,0 +1,38 @@
+# Container images and build trees
+*.sif
+*.sif.sha256
+tvb_sandbox/
+# Scientific artifacts remain external
+*.pt
+*.pth
+*.pkl
+*.fif
+*.fif.gz
+*.edf
+*.bdf
+*.set
+*.fdt
+*.npy
+*.npz
+*.mat
+*.zip
+/tvbgpu/data/*
+!/tvbgpu/data/README.md
+/checkpoints/
+/output/
+/tvbgpu/output/
+/validation_*/
+# Runtime files and local settings
+**/sbi-logs/
+*.log
+*.out
+*.err
+*.pyc
+__pycache__/
+.pytest_cache/
+.cache/
+.idea/
+.vscode/
+.env
+.env.*
+.venv/
