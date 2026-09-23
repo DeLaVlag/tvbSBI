@@ -50,6 +50,25 @@ def fixture():
 
 
 class InferenceContracts(unittest.TestCase):
+    def test_brainvision_crop_and_epoch_dimension(self):
+        c = fixture()
+        values = np.random.default_rng(7).normal(size=(63, 4100)) * 1e-6
+        raw = mne.io.RawArray(values, mne.create_info(
+            c['channel_names'] + ['extra1', 'extra2'], 500, 'eeg'), verbose=False)
+        with patch('mne.io.read_raw_brainvision', return_value=raw) as reader:
+            data, meta = infer_eeg.load_epoch('input.vhdr', c, None, 0)
+            reader.assert_called_once_with('input.vhdr', preload=True)
+        np.testing.assert_array_equal(data, values[np.newaxis, :61, :4001])
+        self.assertEqual(meta['channel_names'], c['channel_names'])
+        self.assertEqual(meta['n_times'], 4001)
+        for condition, index in [('EO', 0), (None, 1)]:
+            with self.assertRaisesRegex(ValueError, 'provides one epoch'):
+                infer_eeg.load_epoch('input.vhdr', c, condition, index)
+        c['channel_names'].reverse()
+        with patch('mne.io.read_raw_brainvision', return_value=raw):
+            with self.assertRaisesRegex(ValueError, 'names/order'):
+                infer_eeg.load_epoch('input.vhdr', c, None, 0)
+
     def test_saved_transform_and_order(self):
         c = fixture()
         rng = np.random.default_rng(1)

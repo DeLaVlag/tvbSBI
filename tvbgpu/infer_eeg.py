@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Infer a seven-parameter posterior for one explicitly selected prepared EEG epoch."""
+"""Infer a seven-parameter posterior from BrainVision EEG or prepared MNE epochs."""
 import argparse
 import csv
 from datetime import datetime, timezone
@@ -15,12 +15,25 @@ LOG = logging.getLogger("infer_eeg")
 
 
 def load_epoch(path, checkpoint, condition, epoch_index, channel_order=None):
-    """Read prepared MNE epochs; never invent a montage or change preprocessing."""
+    """Read FIF epochs or the first 61 channels/4001 samples of BrainVision EEG."""
     import mne
     import numpy as np
     from tvbgpu.analysis.sbi_features import validate_checkpoint_features, validate_eeg
     config = validate_checkpoint_features(checkpoint)
-    epochs = mne.read_epochs(str(path), preload=False, verbose="ERROR")
+    brainvision = Path(path).suffix.lower() == ".vhdr"
+    if brainvision:
+        if condition is not None or epoch_index != 0:
+            raise ValueError("BrainVision input provides one epoch: use --epoch-index 0 "
+                             "and omit --condition")
+        raw = mne.io.read_raw_brainvision(str(path), preload=True)
+        LOG.debug("EEG input info %s", raw.info)
+        data = raw.get_data()[:61, :4001]
+        all_epochs = data[np.newaxis, :, :]
+        info = mne.pick_info(raw.info, list(range(data.shape[0])))
+        epochs = mne.EpochsArray(all_epochs, info, event_id={"BrainVision": 1},
+                                 verbose="ERROR")
+    else:
+        epochs = mne.read_epochs(str(path), preload=False, verbose="ERROR")
     if condition:
         if condition not in epochs.event_id:
             raise ValueError(f"Condition {condition!r} is absent from event_id {epochs.event_id}. "
@@ -147,9 +160,11 @@ def plot_posterior(samples, rows, destination):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--eeg", required=True, type=Path, help="Prepared MNE Epochs FIF file")
+    parser.add_argument("--eeg", required=True, type=Path,
+                        help="BrainVision .vhdr (first 61 channels/4001 samples) or prepared MNE Epochs FIF")
     parser.add_argument("--output-dir", required=True, type=Path, help="New result directory")
-    parser.add_argument("--epoch-index", required=True, type=int, help="Zero-based index after condition selection")
+    parser.add_argument("--epoch-index", default=0, type=int,
+                        help="Zero-based index after condition selection (default: 0; must be 0 for BrainVision)")
     parser.add_argument("--condition", help="Exact MNE event_id label, e.g. EO or EC")
     parser.add_argument("--channel-order", type=Path, help="Verified JSON channel list when absent from checkpoint")
     parser.add_argument("--num-samples", type=int, default=1000)
