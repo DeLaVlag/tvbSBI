@@ -101,7 +101,7 @@ def get_logger_o(loggername):
 
 logger = get_logger_o('tvb.SBI')
 # logger.setLevel(level='INFO' if True else 'WARNING')
-logger.setLevel(level='DEBUG' if True else 'WARNING')
+logger.setLevel(level='INFO' if True else 'WARNING')
 if my_rank == 0:
     logger.info('Starting logger for rank 0')
     logger.info('MPI World Size %d', world_size)
@@ -759,7 +759,7 @@ def runmain():
         )
         aecc_pca = aecc_pca_model.fit_transform(aecc_all)
 
-        print("fc_pca std:", fc_pca.std(axis=0))
+        # print("fc_pca std:", fc_pca.std(axis=0))
         print("dfa_curve_pca std:", dfa_curve_pca.std(axis=0))
         print("lya_curve_pca std:", lya_curve_pca.std(axis=0))
         print("pli_pca std:", pli_pca.std(axis=0))
