@@ -926,7 +926,7 @@ def runmain():
 
         torch.save(
             save_obj,
-            os.path.join(output_rootpath, "sbi_full.pt"),
+            os.path.join(output_rootpath, "sbi_heidel26.pt"),
         )
 
         tocall = time.time()
