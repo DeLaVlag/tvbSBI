@@ -12,6 +12,119 @@ import subprocess
 import time
 
 LOG = logging.getLogger("infer_eeg")
+EBRAINS_LABEL = "EBRAINS synthetic TVB EEG — sub-001"
+
+
+def load_ebrains_dk68_connectivity(atlas_path, weights_path, distance_path):
+    """Select DK68 cortex from EBRAINS DK84 in its existing order."""
+    import numpy as np
+    with Path(atlas_path).open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.reader(stream, delimiter="\t"))
+    # Accept a named label column, or a plain one-label-per-line atlas.
+    label_columns = {"name", "label", "region", "region_name", "region_label"}
+    columns = [i for i, value in enumerate(rows[0])
+               if value.strip().lower() in label_columns] if rows else []
+    if len(columns) == 1:
+        column = columns[0]
+        if any(len(row) != len(rows[0]) for row in rows[1:]):
+            raise ValueError("Atlas TSV has inconsistent columns")
+        labels = [row[column].strip() for row in rows[1:]]
+    elif len(rows) == 84 and all(len(row) == 1 for row in rows):
+        labels = [row[0].strip() for row in rows]
+    else:
+        raise ValueError("Atlas TSV must have one name/label/region/region_name/region_label "
+                         "column, or 84 headerless labels")
+    if len(labels) != 84 or not all(labels):
+        raise ValueError("DK84 atlas must contain exactly 84 nonempty labels")
+    matrices = []
+    cortical_idx = np.r_[np.arange(8, 42), np.arange(50, 84)]
+    for path in (weights_path, distance_path):
+        matrix = np.loadtxt(path, delimiter="\t")
+        if matrix.shape != (84, 84) or not np.isfinite(matrix).all():
+            raise ValueError(f"{path}: expected finite (84, 84) connectivity matrix")
+        cortical = matrix[np.ix_(cortical_idx, cortical_idx)]
+        if cortical.shape != (68, 68) or not np.isfinite(cortical).all():
+            raise ValueError("Invalid cortical connectivity")
+        matrices.append(cortical)
+    labels68 = [labels[i] for i in cortical_idx]
+    if len(labels68) != 68:
+        raise ValueError("Expected 68 cortical labels")
+    print("[CONNECTIVITY]\nOriginal: 84 x 84\nCortical: 68 x 68\nRegions: 68\n"
+          f"First region: {labels68[0]}\nLast region: {labels68[-1]}\n"
+          f"First labels: {labels68[:3]}\nLast labels: {labels68[-3:]}", flush=True)
+    return matrices[0], matrices[1], labels68
+
+
+def load_ebrains_epoch(path, checkpoint, epoch_index=0, channel_order=None, window_samples=None):
+    """Load sensor-space EEG; resample, then select one nonoverlapping window."""
+    import mne
+    import numpy as np
+    from tvbgpu.analysis.sbi_features import validate_checkpoint_features, validate_eeg
+    config = validate_checkpoint_features(checkpoint)
+    raw = mne.io.read_raw_brainvision(str(path), preload=True)
+    original_sfreq, original_samples = float(raw.info["sfreq"]), int(raw.n_times)
+    finite = bool(np.isfinite(raw.get_data()).all())
+    print(f"[EBRAINS]\n{EBRAINS_LABEL}\nEEG file: {path}\n"
+          f"Channels: {len(raw.ch_names)}\nSampling rate: {original_sfreq} Hz\n"
+          f"Samples: {original_samples}\nDuration: {original_samples / original_sfreq:.6g} s\n"
+          f"Finite: {finite}\nCHANNEL ORDER: {raw.ch_names}", flush=True)
+    if len(raw.ch_names) != 61 or config.n_channels != 61:
+        raise ValueError("EBRAINS EEG and checkpoint must both have exactly 61 channels")
+    if not finite:
+        raise ValueError("EBRAINS EEG contains NaN or Inf")
+    if raw.info["bads"] or any(kind != "eeg" for kind in raw.get_channel_types()):
+        raise ValueError("EBRAINS input must contain EEG channels only, with no unresolved bad channels")
+    if len(set(raw.ch_names)) != 61 or not all(raw.ch_names):
+        raise ValueError("EBRAINS input must have 61 unique nonempty channel names")
+    expected = checkpoint.get("channel_names")
+    source = "checkpoint"
+    if channel_order is not None:
+        supplied = json.loads(Path(channel_order).read_text())
+        if expected is not None and supplied != list(expected):
+            raise ValueError("Channel manifest disagrees with checkpoint channel_names")
+        expected, source = supplied, str(Path(channel_order).resolve())
+    if expected is None:
+        source = "ebrains_brainvision_order_assumed"
+    elif not isinstance(expected, (list, tuple)) or list(expected) != raw.ch_names:
+        raise ValueError("EEG channel names/order do not exactly match the checkpoint/manifest")
+    assumption = ("This mode assumes the 61-channel EBRAINS sensor ordering corresponds "
+                  "to the 61-channel observation space used by the checkpoint; "
+                  "BrainVision ordering is preserved.")
+    LOG.warning(assumption)
+    if not np.isfinite(config.fs) or config.fs <= 0:
+        raise ValueError("Checkpoint sampling frequency must be finite and positive")
+    resampled = not np.isclose(original_sfreq, config.fs, rtol=0, atol=1e-8)
+    if resampled:
+        LOG.info("Resampling EBRAINS EEG from %g to %g Hz", original_sfreq, config.fs)
+        raw.resample(config.fs)
+    expected_times = checkpoint.get("preprocessing_config", {}).get("n_times")
+    if expected_times is not None and window_samples is not None and window_samples != expected_times:
+        raise ValueError("--window-samples disagrees with checkpoint preprocessing n_times")
+    n_times = expected_times if expected_times is not None else window_samples
+    if n_times is None:
+        n_times = 4001
+        LOG.warning("Checkpoint lacks preprocessing n_times; assuming a 4001-sample workshop window")
+    if not isinstance(n_times, (int, np.integer)) or n_times <= 500 or epoch_index < 0:
+        raise ValueError("Window length must be an integer >500 and epoch index must be nonnegative")
+    start, stop = epoch_index * n_times, (epoch_index + 1) * n_times
+    if stop > raw.n_times:
+        raise ValueError(f"Requested window [{start}:{stop}] exceeds {raw.n_times} samples after resampling")
+    data = raw.get_data(start=start, stop=stop)[np.newaxis, :, :]
+    validate_eeg(data, config)
+    LOG.info("Selected sensor-space EEG window: shape=%s, sfreq=%g Hz, samples=%d:%d",
+             data.shape, raw.info["sfreq"], start, stop)
+    return data, dict(observation_label=EBRAINS_LABEL, condition="rest", epoch_index=epoch_index,
+                      interpretation="Trained-model posterior under possible model mismatch; "
+                      "not recovery of the original hidden generating parameters",
+                      channel_names=raw.ch_names, channel_order_source=source,
+                      channel_order_assumption=assumption, sfreq=float(raw.info["sfreq"]),
+                      original_sfreq=original_sfreq, original_n_times=original_samples,
+                      resampled=resampled, n_times=int(n_times), start_sample=int(start),
+                      stop_sample=int(stop), tmin=start / config.fs, tmax=(stop - 1) / config.fs,
+                      epoch_length_verified=expected_times is not None,
+                      window_length_source="checkpoint" if expected_times is not None else
+                      "cli" if window_samples is not None else "workshop_default",
+                      bad_channels=[], observed_eeg_projected=False)
 
 
 def load_epoch(path, checkpoint, condition, epoch_index, channel_order=None):
@@ -133,7 +246,7 @@ def summarize(samples, names, low, high):
     return rows
 
 
-def plot_posterior(samples, rows, destination):
+def plot_posterior(samples, rows, destination, observation_label=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -150,7 +263,7 @@ def plot_posterior(samples, rows, destination):
     axes.flat[-1].axis("off")
     handles, labels = axes.flat[0].get_legend_handles_labels()
     axes.flat[-1].legend(handles, labels, loc="center")
-    fig.suptitle("Plausible parameter values given this EEG epoch and trained model")
+    fig.suptitle(observation_label or "Plausible parameter values given this EEG epoch and trained model")
     fig.text(.5, .01, "Narrow credible intervals alone do not establish accurate recovery or calibration.", ha="center")
     fig.tight_layout(rect=(0, .03, 1, .95))
     fig.savefig(destination, dpi=160)
@@ -160,11 +273,18 @@ def plot_posterior(samples, rows, destination):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--eeg", required=True, type=Path,
+    parser.add_argument("--input-format", choices=("auto", "ebrains-synthetic"), default="auto")
+    parser.add_argument("--eeg", type=Path,
                         help="BrainVision .vhdr (first 61 channels/4001 samples) or prepared MNE Epochs FIF")
+    parser.add_argument("--eeg-vhdr", type=Path, help="BrainVision .vhdr for ebrains-synthetic mode")
+    parser.add_argument("--dk-atlas", type=Path)
+    parser.add_argument("--connectivity-weights", type=Path)
+    parser.add_argument("--connectivity-distances", type=Path)
+    parser.add_argument("--window-samples", type=int,
+                        help="EBRAINS window length after resampling; saved n_times takes precedence, otherwise 4001")
     parser.add_argument("--output-dir", required=True, type=Path, help="New result directory")
     parser.add_argument("--epoch-index", default=0, type=int,
-                        help="Zero-based index after condition selection (default: 0; must be 0 for BrainVision)")
+                        help="Zero-based epoch/window index (default: 0; non-EBRAINS BrainVision requires 0)")
     parser.add_argument("--condition", help="Exact MNE event_id label, e.g. EO or EC")
     parser.add_argument("--channel-order", type=Path, help="Verified JSON channel list when absent from checkpoint")
     parser.add_argument("--num-samples", type=int, default=1000)
@@ -173,6 +293,20 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.num_samples < 2 or args.epoch_index < 0 or not 0 <= args.seed < 2**32:
         parser.error("Require num-samples >= 2, epoch-index >= 0, and 0 <= seed < 2**32")
+    connectivity_paths = (args.dk_atlas, args.connectivity_weights, args.connectivity_distances)
+    if args.input_format == "ebrains-synthetic":
+        if (args.eeg is None) == (args.eeg_vhdr is None):
+            parser.error("EBRAINS mode requires exactly one of --eeg-vhdr or --eeg")
+        args.eeg = args.eeg_vhdr if args.eeg_vhdr is not None else args.eeg
+        if args.eeg.suffix.lower() != ".vhdr" or args.condition is not None:
+            parser.error("EBRAINS mode requires a .vhdr file and no --condition")
+        if any(connectivity_paths) and not all(connectivity_paths):
+            parser.error("Supply --dk-atlas, --connectivity-weights and --connectivity-distances together")
+        if args.window_samples is not None and args.window_samples <= 500:
+            parser.error("--window-samples must be >500")
+    elif (args.eeg is None or args.eeg_vhdr is not None or any(connectivity_paths)
+          or args.window_samples is not None):
+        parser.error("Default mode requires --eeg; EBRAINS options require --input-format ebrains-synthetic")
     return args
 
 
@@ -201,12 +335,34 @@ def run(args):
     LOG.info("Checkpoint loaded: %s; full/final features %s/%s", args.checkpoint,
              checkpoint["x_full_dim"], checkpoint["x_dim"])
     tick = time.perf_counter()
-    data, eeg_metadata = load_epoch(args.eeg, checkpoint, args.condition, args.epoch_index, args.channel_order)
+    connectivity_metadata = None
+    observation_label = None
+    if args.input_format == "ebrains-synthetic":
+        observation_label = EBRAINS_LABEL
+        data, eeg_metadata = load_ebrains_epoch(args.eeg, checkpoint, args.epoch_index,
+                                               args.channel_order, args.window_samples)
+        LOG.warning("Posterior describes this trained model under possible model mismatch; "
+                    "it does not establish recovery of the original hidden generating parameters.")
+        if args.dk_atlas is not None:
+            _, _, labels = load_ebrains_dk68_connectivity(
+                args.dk_atlas, args.connectivity_weights, args.connectivity_distances)
+            connectivity_metadata = dict(atlas=str(args.dk_atlas.resolve()),
+                weights=str(args.connectivity_weights.resolve()),
+                distances=str(args.connectivity_distances.resolve()), region_labels=labels,
+                cortical_indices=list(range(8, 42)) + list(range(50, 84)),
+                used_for_resimulation=False)
+            LOG.info("Connectivity validated only; this endpoint does not perform resimulation")
+    else:
+        data, eeg_metadata = load_epoch(args.eeg, checkpoint, args.condition, args.epoch_index, args.channel_order)
     if not torch.cuda.is_available():
         raise RuntimeError("Canonical DFA/LYA feature extraction requires a working CUDA/PyCUDA "
                            "environment (Apptainer --nv). --device cpu selects posterior sampling only.")
     with torch.no_grad():
         raw, processed = extract_observation(data, checkpoint)
+    print(f"[FEATURES]\nRaw feature shape: {raw.shape} (post-PCA, before feature_keep)\n"
+          f"Retained feature shape: {processed.shape}\n"
+          f"Finite: {bool(np.isfinite(raw).all() and np.isfinite(processed).all())}\n"
+          f"Checkpoint expected dimension: {checkpoint['x_dim']}", flush=True)
     timings["eeg_loading_preprocessing_features_seconds"] = time.perf_counter() - tick
     tick = time.perf_counter()
     observation = torch.as_tensor(processed, dtype=torch.float32, device=args.device)
@@ -223,7 +379,7 @@ def run(args):
         writer.writeheader()
         writer.writerows(rows)
     tick = time.perf_counter()
-    plot_posterior(samples, rows, out / "posterior_distributions.png")
+    plot_posterior(samples, rows, out / "posterior_distributions.png", observation_label)
     timings["plotting_seconds"] = time.perf_counter() - tick
     try:
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
@@ -240,6 +396,8 @@ def run(args):
             versions[package] = None
     timings["total_seconds"] = time.perf_counter() - started
     metadata = dict(output_format_version=1, checkpoint=str(args.checkpoint.resolve()),
+                    input_format=args.input_format, observation_label=observation_label,
+                    connectivity=connectivity_metadata,
                     checkpoint_type="trainer_density_estimator", checkpoint_format_version=checkpoint.get("checkpoint_version"),
                     eeg_input=str(args.eeg.resolve()), eeg=eeg_metadata, num_samples=args.num_samples,
                     device=args.device, feature_device="cuda", seed=args.seed, parameter_names=names,

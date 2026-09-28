@@ -46,8 +46,8 @@ inside this endpoint.
 
 ## Input contract
 
-Input is a **prepared MNE Epochs FIF** (`*-epo.fif` or supported compressed FIF),
-not raw continuous EEG. One epoch is selected explicitly with `--epoch-index`
+The default input mode accepts **prepared MNE Epochs FIF** (`*-epo.fif` or
+supported compressed FIF). One epoch is selected with `--epoch-index` (default 0)
 (zero-based **after** condition selection). Multiple conditions require
 `--condition`; its value must be an exact `event_id` key. A filename containing
 EO/EC is not evidence of an event label. Epochs are not averaged or pooled into a
@@ -67,6 +67,72 @@ JSON array containing the verified simulator projection row names. This manifest
 must come from scientific provenance, not simply copying arbitrary input channel
 names. A manifest cannot override saved checkpoint names. No sensitive EEG data
 or verified real channel manifest is added to the repository.
+
+The default mode also accepts BrainVision `.vhdr`, taking the first 61 channels
+and up to 4001 samples, with the same strict channel manifest and sampling-rate
+checks. It requires index 0 and no condition. For the workshop dataset, use the
+explicit EBRAINS mode below instead.
+
+## EBRAINS Days: synthetic TVB EEG, sub-001
+
+`--input-format ebrains-synthetic --eeg-vhdr PATH` reads BrainVision sensor-space
+EEG with MNE, which resolves the accompanying `.eeg` and `.vmrk` files. Exactly
+61 EEG channels, finite data, unique channel names, and no unresolved bad channels
+are required. No projection is applied to observed EEG. The JSON and electrodes
+sidecars are not needed by this endpoint; no montage or reference is inferred.
+
+BrainVision channel order is preserved and printed. When checkpoint channel names
+are absent, no external manifest is required in this mode. A prominent warning
+records the assumption that these sensors correspond to the checkpoint's
+observation space. Saved checkpoint names or an explicitly supplied
+`--channel-order` still must match exactly. All other checkpoint compatibility
+checks remain unchanged.
+
+MNE resamples the continuous recording to `feature_config.fs` when necessary,
+before window selection. The window length uses saved `preprocessing_config.n_times`
+when present. Otherwise `--window-samples` can supply the verified training length;
+the workshop fallback is **4001 samples**, with a warning that the checkpoint
+does not verify this assumption. An override cannot contradict saved `n_times`.
+`--epoch-index k` selects nonoverlapping window `[k*N:(k+1)*N]` after resampling;
+short/incomplete windows are rejected. No filtering or rereferencing is added.
+The existing shared extractor performs temporal standardization, feature
+extraction, saved PCA, ordering, feature retention and saved normalization.
+
+From the repository root, with the dataset in `/tvbgpu/input` and a compatible
+checkpoint at `tvbgpu/output/sbi_heidel26.pt`, run in the CUDA/PyCUDA environment:
+
+```bash
+python -m tvbgpu.infer_eeg \
+  --input-format ebrains-synthetic \
+  --eeg-vhdr /tvbgpu/input/sub-001_task-rest_desc-sim_eeg.vhdr \
+  --checkpoint tvbgpu/output/sbi_heidel26.pt \
+  --dk-atlas /tvbgpu/input/dk_atlas.tsv \
+  --connectivity-weights /tvbgpu/input/sub-001_atlas-dk_desc-weight_conndata-network_connectivity.tsv \
+  --connectivity-distances /tvbgpu/input/sub-001_atlas-dk_desc-distance_conndata-network_connectivity.tsv \
+  --output-dir output/ebrains_sub-001_inference \
+  --epoch-index 0 --num-samples 1000 --device cuda --seed 42
+```
+
+Adjust those paths to your mounted files. The three connectivity arguments are
+optional but must be supplied together. Matrices must be headerless numeric TSVs
+of shape `(84, 84)`. The atlas must have 84 rows and one label column named `name`,
+`label`, `region`, `region_name` or `region_label`, or be 84 headerless labels.
+The loader selects indices `[8:42] + [50:84]` on both matrix axes and on labels:
+34 left cortical regions, then 34 right cortical regions, with **no permutation**.
+It validates finite values and reports the first/last labels. Atlas row order is
+assumed to be the supplied EBRAINS DK84 order already checked against `centres.txt`.
+
+Connectivity is validated and recorded as provenance; it does not alter the
+trained posterior. This endpoint has no posterior resimulation support, so no
+`--use-ebrains-connectivity-for-resimulation` option is added. The simulator's QL
+vertex projection and region mapping remain untouched; the 76-region mapping is
+not used.
+
+The console, plot title and metadata label the observation
+**“EBRAINS synthetic TVB EEG — sub-001”**. Existing seven-parameter samples,
+means, medians, credible intervals and plots are retained. These describe the
+trained model's posterior for a held-out TVB observation under possible model
+mismatch; they do not establish recovery of the original generating parameters.
 
 ## Commands
 
@@ -150,10 +216,11 @@ EEG inference require testing on a GPU host with compatible scientific artifacts
 The current trainer emits the shared checkpoint schema irrespective of budget;
 a fresh TVB workshop training run was not performed as part of inference work.
 
-Before EBRAINS/PyUNICORE integration, supply the authoritative projection channel
-mapping, verified EEG preparation/reference/epoch-duration protocol, compatible
-full checkpoint and GPU environment. Retrieval/authentication and job submission
-remain outside this endpoint.
+EBRAINS/PyUNICORE deployment still requires a compatible checkpoint and GPU
+environment. The explicit EBRAINS input mode records the workshop sensor-order
+and epoch-duration assumptions above; independently verifying those assumptions
+is needed for scientific interpretation. Retrieval/authentication and job
+submission remain outside this endpoint.
 
 Measured local CPU checks: 5 inference tests passed in 70.61 seconds; 12 existing
 posterior-validation tests passed in 0.46 seconds. The synthetic output test used
