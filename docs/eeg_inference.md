@@ -146,12 +146,34 @@ python -m tvbgpu.infer_eeg \
 
 Adjust those paths to your mounted files. The three connectivity arguments are
 optional but must be supplied together. Matrices must be headerless numeric TSVs
-of shape `(84, 84)`. The atlas must have 84 rows and one label column named `name`,
-`label`, `region`, `region_name` or `region_label`, or be 84 headerless labels.
-The loader selects indices `[8:42] + [50:84]` on both matrix axes and on labels:
-34 left cortical regions, then 34 right cortical regions, with **no permutation**.
-It validates finite values and reports the first/last labels. Atlas row order is
-assumed to be the supplied EBRAINS DK84 order already checked against `centres.txt`.
+of shape `(68, 68)` or `(84, 84)`, with one atlas row per matrix row in the same
+order. A single header row is detected using the matrix size. Label columns are
+identified from DK names, normalized common headings, or a unique textual column;
+ambiguous columns are rejected. Unknown headings and headerless tables are supported.
+The loader prints the atlas path, raw/data shapes, columns, first ten rows, header
+detection, matrix shapes, region counts, and final labels/indices.
+
+Region identities are checked against `centres.txt` in the repository's bundled
+`connectivity_zerlaut_68_newcentres.zip`. Common hemisphere conventions such as
+`ctx-lh-bankssts`, `Left-bankssts`, `bankssts_L`, and separate `hemisphere` columns
+are normalized. DK68 must contain every bilateral cortical identity exactly once.
+DK84 must additionally contain 16 recognized subcortical/cerebellar labels; unknown or duplicate
+identities fail explicitly. Cortical indices are derived from labels, and **original
+ordering is preserved without permutation** on both matrix axes. Differing simulator
+order is reported and warned about, never silently aligned. A label vocabulary not
+recognized by these checks needs an explicit anatomical alias rather than index-based
+guessing. All output matrices must be finite `(68, 68)` with 68 labels. The helper
+also accepts an omitted distance matrix; the existing inference CLI still takes all
+three connectivity arguments together.
+
+The supplied sub-001 `dk_atlas.tsv` was inspected: it has a header (`label`, `name`)
+and 84 data rows. `label` contains machine-readable anatomical identities; `name`
+contains human-readable descriptions. The original parser rejected it because
+both headings matched its allowlist and it required exactly one match. Both supplied
+matrices are finite 84×84. Label-based selection finds 68 DK cortical regions,
+14 subcortical regions and 2 cerebellar-cortex regions. The selected indices are
+8–41 and 50–83 (zero-based), verified from the labels rather than assumed. Their
+order matches all 68 simulator `centres.txt` identities without permutation.
 
 Connectivity is validated and recorded as provenance; it does not alter the
 trained posterior. This endpoint has no posterior resimulation support, so no

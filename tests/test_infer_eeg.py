@@ -171,24 +171,74 @@ class InferenceContracts(unittest.TestCase):
     def test_ebrains_connectivity_order_and_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             atlas, weights, distances = [Path(tmp) / name for name in ('atlas.tsv', 'w.tsv', 'd.tsv')]
-            atlas.write_text('index\tname\n' + ''.join(f'{i}\tregion{i}\n' for i in range(84)))
+            dk = infer_eeg.dk68_reference_labels()
+            sub = ['cerebellumcortex', 'thalamus', 'caudate', 'putamen', 'pallidum',
+                   'hippocampus', 'amygdala', 'accumbensarea']
+            names = [n + '_L' for n in sub] + dk[:34] + [n + '_R' for n in sub] + dk[34:]
+            # Actual EBRAINS layout: both headings matched the old allowlist.
+            atlas.write_text('label\tname\n' + ''.join(f'{n}\tDescription {i}\n' for i, n in enumerate(names)))
             matrix = np.arange(84 * 84).reshape(84, 84)
             np.savetxt(weights, matrix, delimiter='\t')
             np.savetxt(distances, matrix + 1, delimiter='\t')
-            w, d, labels = infer_eeg.load_ebrains_dk68_connectivity(atlas, weights, distances)
+            w, d, labels, metadata = infer_eeg.load_ebrains_dk68_connectivity(
+                atlas, weights, distances, return_metadata=True)
+            self.assertEqual(metadata['subcortical_regions'], 14)
+            self.assertEqual(metadata['cerebellar_regions'], 2)
+            self.assertEqual(metadata['atlas_label_column'], 0)
             self.assertEqual(w.shape, (68, 68))
-            self.assertEqual(labels, [f'region{i}' for i in list(range(8, 42)) + list(range(50, 84))])
+            self.assertEqual(labels, dk)
             self.assertEqual(w[0, 0], matrix[8, 8])
             self.assertEqual(w[33, 34], matrix[41, 50])
             self.assertEqual(w[-1, -1], matrix[83, 83])
             np.testing.assert_array_equal(d, w + 1)
             for invalid in (np.zeros((68, 68)), np.full((84, 84), np.nan)):
                 np.savetxt(weights, invalid, delimiter='\t')
-                with self.assertRaisesRegex(ValueError, 'finite .*84, 84'):
+                with self.assertRaises(ValueError):
                     infer_eeg.load_ebrains_dk68_connectivity(atlas, weights, distances)
+            np.savetxt(weights, matrix, delimiter='\t')
             atlas.write_text('name\n' + 'region\n' * 83)
-            with self.assertRaisesRegex(ValueError, '84 nonempty labels'):
+            with self.assertRaisesRegex(ValueError, 'not verified DK68'):
                 infer_eeg.load_ebrains_dk68_connectivity(atlas, weights, distances)
+
+    def test_dk68_atlas_formats_and_no_permutation(self):
+        dk = infer_eeg.dk68_reference_labels()
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, weights = Path(tmp) / 'atlas.tsv', Path(tmp) / 'weights.tsv'
+            matrix = np.arange(68 * 68).reshape(68, 68)
+            np.savetxt(weights, matrix, delimiter='\t')
+            formats = [('\n'.join(dk), False),
+                       ('unfamiliar\n' + '\n'.join(dk), True),
+                       (' ROI_NAME \tindex\n' + '\n'.join(f'{name}\t{i}' for i, name in enumerate(dk)), True),
+                       ('title\themisphere\n' + '\n'.join(
+                           f'{name[:-2]}\t{"left" if name.endswith("_L") else "right"}' for name in dk), True)]
+            for content, header in formats:
+                atlas.write_text(content)
+                w, d, labels, metadata = infer_eeg.load_ebrains_dk68_connectivity(
+                    atlas, weights, return_metadata=True)
+                np.testing.assert_array_equal(w, matrix)
+                self.assertIsNone(d)
+                self.assertEqual(len(labels), 68)
+                self.assertEqual(metadata['atlas_has_header'], header)
+                self.assertTrue(metadata['matches_simulator_order'])
+            # Permuted DK84: selection is anatomical, not fixed blocks or first 68.
+            sub = [f'{hemi}-{name}' for hemi in ('Left', 'Right') for name in (
+                'Thalamus-Proper', 'Caudate', 'Putamen', 'Pallidum', 'Hippocampus',
+                'Amygdala', 'Accumbens-area', 'VentralDC')]
+            cortex = [('ctx-lh-' if name.endswith('_L') else 'ctx-rh-') + name[:-2] for name in dk]
+            order = np.random.default_rng(14).permutation(84)
+            names = [ (cortex + sub)[i] for i in order ]
+            atlas.write_text('strange_label\tnumeric_id\n' + '\n'.join(f'{n}\t{i}' for i, n in enumerate(names)))
+            matrix = np.arange(84 * 84).reshape(84, 84)
+            np.savetxt(weights, matrix, delimiter='\t')
+            w, _, labels, metadata = infer_eeg.load_ebrains_dk68_connectivity(atlas, weights, return_metadata=True)
+            selected = np.flatnonzero(order < 68)
+            np.testing.assert_array_equal(w, matrix[np.ix_(selected, selected)])
+            self.assertEqual(metadata['cortical_indices'], selected.tolist())
+            self.assertEqual(labels, [names[i] for i in selected])
+            self.assertFalse(metadata['matches_simulator_order'])
+            atlas.write_text('strange_label\n' + '\n'.join(names[:-1] + ['unknown_anatomy']))
+            with self.assertRaisesRegex(ValueError, 'not verified DK68'):
+                infer_eeg.load_ebrains_dk68_connectivity(atlas, weights)
 
     def test_ebrains_cli(self):
         base = ['--checkpoint', 'model.pt', '--output-dir', 'results']

@@ -15,44 +15,147 @@ LOG = logging.getLogger("infer_eeg")
 EBRAINS_LABEL = "EBRAINS synthetic TVB EEG — sub-001"
 
 
-def load_ebrains_dk68_connectivity(atlas_path, weights_path, distance_path):
-    """Select DK68 cortex from EBRAINS DK84 in its existing order."""
+def dk68_reference_labels():
+    """Use the simulator's bundled centres as the DK identity reference."""
+    import zipfile
+    archive = Path(__file__).parent / "data" / "connectivity_zerlaut_68_newcentres.zip"
+    with zipfile.ZipFile(archive) as stream:
+        text = stream.read("QL_20120814_Connectivity/centres.txt").decode("utf-8")
+    return [line.split()[0] for line in text.splitlines() if line.strip()]
+
+
+def normalize_region_label(label):
+    """Normalize spelling/separators and hemisphere placement, not anatomical identity."""
+    import re
+    value = re.sub(r"[^a-z0-9]", "", label.strip().lower())
+    if value.startswith("ctx"):
+        value = value[3:]
+    for marker, hemisphere in (("left", "l"), ("right", "r"), ("lh", "l"), ("rh", "r")):
+        if value.startswith(marker):
+            return value[len(marker):] + hemisphere
+        if value.endswith(marker):
+            return value[:-len(marker)] + hemisphere
+    # Short hemisphere prefixes such as L_bankssts; canonical suffixes stay put.
+    if re.match(r"^[lr][_.\s-]", label.strip().lower()):
+        return value[1:] + value[0]
+    return value
+
+
+def load_ebrains_dk68_connectivity(atlas_path, weights_path, distance_path=None, *, return_metadata=False):
+    """Identify all bilateral DK cortical labels; preserve their input ordering."""
     import numpy as np
+    print(f"[CONNECTIVITY]\nAtlas file: {Path(atlas_path).resolve()}", flush=True)
     with Path(atlas_path).open(encoding="utf-8-sig", newline="") as stream:
-        rows = list(csv.reader(stream, delimiter="\t"))
-    # Accept a named label column, or a plain one-label-per-line atlas.
-    label_columns = {"name", "label", "region", "region_name", "region_label"}
-    columns = [i for i, value in enumerate(rows[0])
-               if value.strip().lower() in label_columns] if rows else []
-    if len(columns) == 1:
-        column = columns[0]
-        if any(len(row) != len(rows[0]) for row in rows[1:]):
-            raise ValueError("Atlas TSV has inconsistent columns")
-        labels = [row[column].strip() for row in rows[1:]]
-    elif len(rows) == 84 and all(len(row) == 1 for row in rows):
-        labels = [row[0].strip() for row in rows]
-    else:
-        raise ValueError("Atlas TSV must have one name/label/region/region_name/region_label "
-                         "column, or 84 headerless labels")
-    if len(labels) != 84 or not all(labels):
-        raise ValueError("DK84 atlas must contain exactly 84 nonempty labels")
+        rows = [[cell.strip() for cell in row] for row in csv.reader(stream, delimiter="\t")
+                if any(cell.strip() for cell in row)]
+    print(f"TSV raw shape (including any header): ({len(rows)}, {len(rows[0]) if rows else 0})\n"
+          f"First 10 raw rows: {json.dumps(rows[:10], ensure_ascii=False)}", flush=True)
+    if not rows or any(len(row) != len(rows[0]) for row in rows):
+        raise ValueError("Atlas TSV is empty or has inconsistent column counts; see raw rows above")
     matrices = []
-    cortical_idx = np.r_[np.arange(8, 42), np.arange(50, 84)]
-    for path in (weights_path, distance_path):
-        matrix = np.loadtxt(path, delimiter="\t")
-        if matrix.shape != (84, 84) or not np.isfinite(matrix).all():
-            raise ValueError(f"{path}: expected finite (84, 84) connectivity matrix")
-        cortical = matrix[np.ix_(cortical_idx, cortical_idx)]
-        if cortical.shape != (68, 68) or not np.isfinite(cortical).all():
-            raise ValueError("Invalid cortical connectivity")
-        matrices.append(cortical)
-    labels68 = [labels[i] for i in cortical_idx]
-    if len(labels68) != 68:
-        raise ValueError("Expected 68 cortical labels")
-    print("[CONNECTIVITY]\nOriginal: 84 x 84\nCortical: 68 x 68\nRegions: 68\n"
-          f"First region: {labels68[0]}\nLast region: {labels68[-1]}\n"
-          f"First labels: {labels68[:3]}\nLast labels: {labels68[-3:]}", flush=True)
-    return matrices[0], matrices[1], labels68
+    for kind, path in (("Connectivity", weights_path), ("Tract lengths", distance_path)):
+        if path is None:
+            matrices.append(None)
+            continue
+        print(f"{kind} file: {Path(path).resolve()}", flush=True)
+        matrix = np.loadtxt(path, delimiter="\t", ndmin=2)
+        print(f"{kind} shape: {matrix.shape}", flush=True)
+        if matrix.shape[0] != matrix.shape[1] or not np.isfinite(matrix).all():
+            raise ValueError(f"{kind}: expected a finite square matrix; got {matrix.shape}")
+        matrices.append(matrix)
+    n_regions = matrices[0].shape[0]
+    if matrices[1] is not None and matrices[1].shape != matrices[0].shape:
+        raise ValueError(f"Weights shape {matrices[0].shape} != tract lengths shape {matrices[1].shape}")
+    # Matrix size disambiguates the first row without guessing from unfamiliar headings.
+    if len(rows) == n_regions + 1:
+        header, data = rows[0], rows[1:]
+    elif len(rows) == n_regions:
+        header, data = None, rows
+    else:
+        raise ValueError(f"Atlas has {len(rows)} nonblank rows; matrix has {n_regions} regions. "
+                         "Expected one atlas row per region, optionally preceded by one header row")
+    print(f"Header present: {header is not None} (inferred from matrix row count)\n"
+          f"Columns: {header if header is not None else list(range(len(rows[0])))}\n"
+          f"TSV data shape: ({len(data)}, {len(data[0])})\nFirst 10 data rows: "
+          f"{json.dumps(data[:10], ensure_ascii=False)}", flush=True)
+    reference = [normalize_region_label(label) for label in dk68_reference_labels()]
+    reference_set = set(reference)
+    subcortical_bases = {"thalamus", "thalamusproper", "caudate", "putamen", "pallidum",
+                        "hippocampus", "amygdala", "accumbens", "accumbensarea", "ventraldc"}
+    cerebellar_bases = {"cerebellumcortex"}
+    unqualified_regions = {label[:-1] for label in reference} | subcortical_bases | cerebellar_bases
+    normalized_header = [name.strip().lower() for name in header] if header else []
+    hemisphere_cols = [i for i, name in enumerate(normalized_header) if name in ("hemi", "hemisphere")]
+
+    def column_labels(column):
+        labels = [row[column] for row in data]
+        if len(hemisphere_cols) == 1 and column != hemisphere_cols[0]:
+            hemi = hemisphere_cols[0]
+            labels = [row[hemi] + "_" + label if normalize_region_label(label) in unqualified_regions
+                      else label for label, row in zip(labels, data)]
+        return labels
+
+    scores = [sum(normalize_region_label(label) in reference_set for label in column_labels(i))
+              for i in range(len(data[0]))]
+    candidates = [i for i, score in enumerate(scores) if score == max(scores) and score > 0]
+    if not candidates:
+        aliases = {"name", "label", "region", "region_name", "region_label", "regionname",
+                   "regionlabel", "roi", "roi_name", "anatomical_name"}
+        candidates = [i for i, name in enumerate(normalized_header) if name in aliases]
+    if not candidates:
+        def is_number(value):
+            try:
+                float(value)
+                return True
+            except ValueError:
+                return False
+        candidates = [i for i in range(len(data[0]))
+                      if all(row[i] and not is_number(row[i]) for row in data)]
+    if len(candidates) != 1:
+        raise ValueError(f"Ambiguous/unidentified atlas label column: candidates={candidates}, "
+                         f"columns={header}, DK label match counts={scores}. No column was guessed")
+    column = candidates[0]
+    labels = column_labels(column)
+    canonical = [normalize_region_label(label) for label in labels]
+    selected = [i for i, label in enumerate(canonical) if label in reference_set]
+    excluded = [i for i in range(n_regions) if i not in selected]
+    # Recognize bilateral subcortical structures, rather than calling arbitrary extras subcortical.
+    subcortical = {name + hemi for name in subcortical_bases for hemi in ("l", "r")}
+    cerebellar = {name + hemi for name in cerebellar_bases for hemi in ("l", "r")}
+    unknown = [labels[i] for i in excluded if canonical[i] not in subcortical | cerebellar]
+    n_subcortical = sum(canonical[i] in subcortical for i in excluded)
+    n_cerebellar = sum(canonical[i] in cerebellar for i in excluded)
+    print(f"Label column: {header[column] if header else column}\nAtlas input: {len(labels)} regions\n"
+          f"Detected cortical labels: {len(selected)}; subcortical labels: "
+          f"{n_subcortical}; cerebellar labels: {n_cerebellar}\nUnknown labels: {unknown}", flush=True)
+    if (n_regions not in (68, 84) or len(selected) != 68
+            or {canonical[i] for i in selected} != reference_set or unknown
+            or len(set(canonical)) != n_regions):
+        missing = sorted(reference_set - set(canonical))
+        raise ValueError(f"Atlas is not verified DK68 or DK68 + 16 recognized non-DK regions: "
+                         f"total={n_regions}, cortical={len(selected)}, missing DK labels={missing}, "
+                         f"unknown labels={unknown}. Duplicate identities are not permitted")
+    labels68 = [labels[i] for i in selected]
+    result = [matrix[np.ix_(selected, selected)] if matrix is not None else None for matrix in matrices]
+    if any(matrix is not None and (matrix.shape != (68, 68) or not np.isfinite(matrix).all())
+           for matrix in result) or len(labels68) != 68:
+        raise ValueError("Final connectivity must contain 68 labels and finite (68, 68) matrices")
+    same_order = [canonical[i] for i in selected] == reference
+    print(("Atlas already corresponds to DK68" if n_regions == 68 else
+           f"Detected: 68 DK cortical + {n_subcortical} subcortical + {n_cerebellar} cerebellar\n"
+           "Selected DK68 cortical subset") +
+          f"\nSelected original indices: {selected}\nFinal connectivity: 68 x 68\n"
+          f"Region names: {labels68}\nMatches simulator region order: {same_order}", flush=True)
+    if not same_order:
+        LOG.warning("Input cortical order differs from simulator centres; preserved without permutation. "
+                    "Do not use for resimulation without aligning simulator region-dependent data.")
+    metadata = dict(atlas_input_regions=n_regions, atlas_columns=header, atlas_has_header=header is not None,
+                    subcortical_regions=n_subcortical, cerebellar_regions=n_cerebellar,
+                    atlas_shape=[len(data), len(data[0])], atlas_label_column=column,
+                    cortical_indices=selected, excluded_region_labels=[labels[i] for i in excluded],
+                    matches_simulator_order=same_order)
+    answer = (result[0], result[1], labels68)
+    return answer + (metadata,) if return_metadata else answer
 
 
 def approximate_channel_indices(raw, count):
@@ -423,12 +526,12 @@ def run(args):
         LOG.warning("Posterior describes this trained model under possible model mismatch; "
                     "it does not establish recovery of the original hidden generating parameters.")
         if args.dk_atlas is not None:
-            _, _, labels = load_ebrains_dk68_connectivity(
-                args.dk_atlas, args.connectivity_weights, args.connectivity_distances)
+            _, _, labels, atlas_metadata = load_ebrains_dk68_connectivity(
+                args.dk_atlas, args.connectivity_weights, args.connectivity_distances, return_metadata=True)
             connectivity_metadata = dict(atlas=str(args.dk_atlas.resolve()),
                 weights=str(args.connectivity_weights.resolve()),
                 distances=str(args.connectivity_distances.resolve()), region_labels=labels,
-                cortical_indices=list(range(8, 42)) + list(range(50, 84)),
+                **atlas_metadata,
                 used_for_resimulation=False)
             LOG.info("Connectivity validated only; this endpoint does not perform resimulation")
     else:
