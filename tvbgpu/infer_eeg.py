@@ -55,6 +55,27 @@ def load_ebrains_dk68_connectivity(atlas_path, weights_path, distance_path):
     return matrices[0], matrices[1], labels68
 
 
+def approximate_channel_indices(raw, count):
+    """Cover available positions, otherwise channel indices; never infer a montage."""
+    import numpy as np
+    positions = np.asarray([ch["loc"][:3] for ch in raw.info["chs"]])
+    spatial = (np.isfinite(positions).all()
+               and np.all(np.linalg.norm(positions, axis=1) > 0)
+               and len(np.unique(positions, axis=0)) == len(positions)
+               and np.linalg.matrix_rank(positions - positions.mean(axis=0)) >= 2)
+    if spatial:
+        # Farthest-point sampling in the existing coordinate frame. Ties go to
+        # the lowest original index; sorted output preserves acquisition order.
+        selected = [int(np.argmax(np.sum((positions - positions.mean(axis=0)) ** 2, axis=1)))]
+        distances = np.full(len(positions), np.inf)
+        while len(selected) < count:
+            distances = np.minimum(distances, np.sum((positions - positions[selected[-1]]) ** 2, axis=1))
+            distances[selected] = -np.inf
+            selected.append(int(np.argmax(distances)))
+        return np.sort(selected), "approximate_spatial_farthest_point"
+    return np.rint(np.linspace(0, len(raw.ch_names) - 1, count)).astype(int), "approximate_evenly_spaced_indices"
+
+
 def load_ebrains_epoch(path, checkpoint, epoch_index=0, channel_order=None, window_samples=None):
     """Load sensor-space EEG; resample, then select one nonoverlapping window."""
     import mne
@@ -68,14 +89,21 @@ def load_ebrains_epoch(path, checkpoint, epoch_index=0, channel_order=None, wind
           f"Channels: {len(raw.ch_names)}\nSampling rate: {original_sfreq} Hz\n"
           f"Samples: {original_samples}\nDuration: {original_samples / original_sfreq:.6g} s\n"
           f"Finite: {finite}\nCHANNEL ORDER: {raw.ch_names}", flush=True)
-    if len(raw.ch_names) != 61 or config.n_channels != 61:
-        raise ValueError("EBRAINS EEG and checkpoint must both have exactly 61 channels")
+    original_names = list(raw.ch_names)
+    required = config.n_channels
+    LOG.info("Original EEG: %d channels, %.3f Hz. Checkpoint/feature requirements: "
+             "%d channels, %.3f Hz; full/final features %d/%d",
+             len(original_names), original_sfreq, required, config.fs,
+             checkpoint['x_full_dim'], checkpoint['x_dim'])
+    if len(original_names) < required:
+        raise ValueError(f"Input EEG has {len(original_names)} channels; feature extractor requires "
+                         f"{required}. Channels cannot be padded or invented.")
     if not finite:
         raise ValueError("EBRAINS EEG contains NaN or Inf")
     if raw.info["bads"] or any(kind != "eeg" for kind in raw.get_channel_types()):
         raise ValueError("EBRAINS input must contain EEG channels only, with no unresolved bad channels")
-    if len(set(raw.ch_names)) != 61 or not all(raw.ch_names):
-        raise ValueError("EBRAINS input must have 61 unique nonempty channel names")
+    if len(set(raw.ch_names)) != len(raw.ch_names) or not all(raw.ch_names):
+        raise ValueError("EBRAINS input must have unique nonempty channel names")
     expected = checkpoint.get("channel_names")
     source = "checkpoint"
     if channel_order is not None:
@@ -83,20 +111,47 @@ def load_ebrains_epoch(path, checkpoint, epoch_index=0, channel_order=None, wind
         if expected is not None and supplied != list(expected):
             raise ValueError("Channel manifest disagrees with checkpoint channel_names")
         expected, source = supplied, str(Path(channel_order).resolve())
-    if expected is None:
+    if expected is not None and (not isinstance(expected, (list, tuple))
+                                or len(expected) != required or len(set(expected)) != required):
+        raise ValueError(f"Checkpoint/manifest must contain {required} unique channel names")
+    indices = np.arange(len(original_names))
+    method = "original_order"
+    approximate = False
+    if len(original_names) > required:
+        if expected is not None and all(name in original_names for name in expected):
+            indices = np.asarray([original_names.index(name) for name in expected])
+            method = "checkpoint_or_manifest_names"
+        elif channel_order is not None:
+            raise ValueError("Explicit channel manifest names are absent from the input EEG")
+        else:
+            indices, method = approximate_channel_indices(raw, required)
+            approximate = True
+            LOG.warning("Input EEG has %d channels. Feature extractor requires %d channels. "
+                        "No verified montage mapping was found. Selecting %d/%d channels using %s. "
+                        "WORKSHOP/DEMO inference only: no anatomical equivalence to the training montage.",
+                        len(original_names), required, required, len(original_names), method)
+        raw.pick(indices.tolist())
+        LOG.info("Selected original indices (zero-based): %s", indices.tolist())
+        LOG.info("Selected channels: %s", raw.ch_names)
+    if approximate:
+        source = method
+    elif expected is None:
         source = "ebrains_brainvision_order_assumed"
-    elif not isinstance(expected, (list, tuple)) or list(expected) != raw.ch_names:
+    elif list(expected) != raw.ch_names:
         raise ValueError("EEG channel names/order do not exactly match the checkpoint/manifest")
-    assumption = ("This mode assumes the 61-channel EBRAINS sensor ordering corresponds "
-                  "to the 61-channel observation space used by the checkpoint; "
-                  "BrainVision ordering is preserved.")
+    assumption = ("Approximate channel selection for workshop/demo inference; anatomical correspondence "
+                  "to the training montage is unknown." if approximate else
+                  f"This mode assumes the {required}-channel EBRAINS sensor ordering corresponds "
+                  "to the observation space used by the checkpoint.")
     LOG.warning(assumption)
     if not np.isfinite(config.fs) or config.fs <= 0:
         raise ValueError("Checkpoint sampling frequency must be finite and positive")
     resampled = not np.isclose(original_sfreq, config.fs, rtol=0, atol=1e-8)
     if resampled:
-        LOG.info("Resampling EBRAINS EEG from %g to %g Hz", original_sfreq, config.fs)
+        LOG.info("Resampling: %.3f -> %.3f Hz", original_sfreq, config.fs)
         raw.resample(config.fs)
+    if not np.isclose(raw.info["sfreq"], config.fs, rtol=0, atol=1e-8):
+        raise ValueError(f"EEG sampling rate {raw.info['sfreq']} does not match required {config.fs} Hz")
     expected_times = checkpoint.get("preprocessing_config", {}).get("n_times")
     if expected_times is not None and window_samples is not None and window_samples != expected_times:
         raise ValueError("--window-samples disagrees with checkpoint preprocessing n_times")
@@ -113,7 +168,10 @@ def load_ebrains_epoch(path, checkpoint, epoch_index=0, channel_order=None, wind
     validate_eeg(data, config)
     LOG.info("Selected sensor-space EEG window: shape=%s, sfreq=%g Hz, samples=%d:%d",
              data.shape, raw.info["sfreq"], start, stop)
-    return data, dict(observation_label=EBRAINS_LABEL, condition="rest", epoch_index=epoch_index,
+    label = EBRAINS_LABEL + (" — WORKSHOP/DEMO: approximate channel selection" if approximate else "")
+    return data, dict(observation_label=label, condition="rest", epoch_index=epoch_index,
+                      approximate_channel_selection=approximate, channel_selection_method=method,
+                      original_channel_names=original_names, selected_original_indices=indices.tolist(),
                       interpretation="Trained-model posterior under possible model mismatch; "
                       "not recovery of the original hidden generating parameters",
                       channel_names=raw.ch_names, channel_order_source=source,
@@ -246,6 +304,24 @@ def summarize(samples, names, low, high):
     return rows
 
 
+def validate_inference_observation(data, eeg_metadata, full, processed, checkpoint, estimator):
+    """Fail before MCMC if the observation violates the saved feature contract."""
+    import numpy as np
+    from tvbgpu.analysis.sbi_features import validate_checkpoint_features, validate_eeg
+    config = validate_checkpoint_features(checkpoint)
+    validate_eeg(data, config)
+    if not np.isclose(eeg_metadata['sfreq'], config.fs, rtol=0, atol=1e-8):
+        raise ValueError(f"EEG rate {eeg_metadata['sfreq']} Hz; feature extractor requires {config.fs} Hz")
+    for name, values, width in (("Full post-PCA", full, checkpoint['x_full_dim']),
+                                ("Transformed", processed, checkpoint['x_dim'])):
+        if values.shape != (1, width) or not np.isfinite(values).all():
+            raise ValueError(f"{name} features: got shape {values.shape}; expected finite (1, {width})")
+    condition_shape = getattr(estimator, "condition_shape", None)
+    if condition_shape is not None and tuple(condition_shape) != (checkpoint['x_dim'],):
+        raise ValueError(f"Posterior estimator condition shape {tuple(condition_shape)} disagrees "
+                         f"with checkpoint feature dimension {checkpoint['x_dim']}")
+
+
 def plot_posterior(samples, rows, destination, observation_label=None):
     import matplotlib
     matplotlib.use("Agg")
@@ -343,6 +419,7 @@ def run(args):
         observation_label = EBRAINS_LABEL
         data, eeg_metadata = load_ebrains_epoch(args.eeg, checkpoint, args.epoch_index,
                                                args.channel_order, args.window_samples)
+        observation_label = eeg_metadata["observation_label"]
         LOG.warning("Posterior describes this trained model under possible model mismatch; "
                     "it does not establish recovery of the original hidden generating parameters.")
         if args.dk_atlas is not None:
@@ -367,7 +444,10 @@ def run(args):
           f"Checkpoint expected dimension: {checkpoint['x_dim']}", flush=True)
     timings["eeg_loading_preprocessing_features_seconds"] = time.perf_counter() - tick
     tick = time.perf_counter()
+    validate_inference_observation(data, eeg_metadata, raw, processed, checkpoint, estimator)
     observation = torch.as_tensor(processed, dtype=torch.float32, device=args.device)
+    if not torch.isfinite(observation).all():
+        raise ValueError("Observation contains NaN/Inf after conversion to posterior float32 input")
     samples = draw_posteriors(posterior, observation, args.num_samples)[0].numpy()
     rows = summarize(samples, names, low, high)
     timings["posterior_sampling_seconds"] = time.perf_counter() - tick

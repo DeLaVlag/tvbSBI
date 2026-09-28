@@ -52,6 +52,64 @@ def fixture():
 
 
 class InferenceContracts(unittest.TestCase):
+    def test_ebrains_256_channel_fallback_and_saved_rate(self):
+        c = fixture()
+        del c['channel_names']
+        c['feature_config']['fs'] = 200.0
+        c['preprocessing_config']['n_times'] = 600
+        names = [f'E{i + 1}' for i in range(256)]
+        raw = mne.io.RawArray(np.random.default_rng(11).normal(size=(256, 2000)) * 1e-6,
+                              mne.create_info(names, 256.016, 'eeg'), verbose=False)
+        indices = np.rint(np.linspace(0, 255, 61)).astype(int)
+        expected = raw.copy().pick(indices.tolist()).resample(200).get_data(start=600, stop=1200)
+        with patch('mne.io.read_raw_brainvision', return_value=raw), self.assertLogs(infer_eeg.LOG) as logs:
+            data, meta = infer_eeg.load_ebrains_epoch('test.vhdr', c, epoch_index=1)
+        np.testing.assert_allclose(data[0], expected)
+        self.assertEqual(len(set(meta['selected_original_indices'])), 61)
+        self.assertEqual(meta['selected_original_indices'], indices.tolist())
+        self.assertEqual(meta['channel_names'], [names[i] for i in indices])
+        self.assertEqual(meta['sfreq'], 200.0)
+        self.assertTrue(meta['approximate_channel_selection'])
+        self.assertIn('WORKSHOP/DEMO', meta['observation_label'])
+        self.assertTrue(any('Selected channels:' in line for line in logs.output))
+
+    def test_spatial_selection_is_deterministic_and_preserves_order(self):
+        raw = mne.io.RawArray(np.zeros((256, 601)),
+                              mne.create_info([f'E{i}' for i in range(256)], 500, 'eeg'), verbose=False)
+        positions = np.random.default_rng(12).normal(size=(256, 3))
+        positions /= np.linalg.norm(positions, axis=1, keepdims=True)
+        montage = mne.channels.make_dig_montage(ch_pos=dict(zip(raw.ch_names, positions * .09)),
+                                               coord_frame='head')
+        raw.set_montage(montage)
+        indices, method = infer_eeg.approximate_channel_indices(raw, 61)
+        self.assertEqual(method, 'approximate_spatial_farthest_point')
+        self.assertEqual(len(set(indices)), 61)
+        self.assertTrue(np.all(np.diff(indices) > 0))
+        np.testing.assert_array_equal(indices, infer_eeg.approximate_channel_indices(raw, 61)[0])
+        # One missing position makes the complete montage unusable for spatial coverage.
+        raw.info['chs'][0]['loc'][:3] = np.nan
+        fallback, method = infer_eeg.approximate_channel_indices(raw, 61)
+        self.assertEqual(method, 'approximate_evenly_spaced_indices')
+        np.testing.assert_array_equal(fallback, np.rint(np.linspace(0, 255, 61)).astype(int))
+
+    def test_pre_inference_dimensions_rate_and_finiteness(self):
+        c = fixture()
+        data = np.zeros((1, 61, 600))
+        full, processed = np.zeros((1, c['x_full_dim'])), np.zeros((1, c['x_dim']))
+        estimator = Mock(condition_shape=(c['x_dim'],))
+        infer_eeg.validate_inference_observation(data, {'sfreq': 500}, full, processed, c, estimator)
+        for bad_data, meta, bad_full, bad_processed, model, error in [
+            (data, {'sfreq': 200}, full, processed, estimator, 'rate'),
+            (data[:, :60], {'sfreq': 500}, full, processed, estimator, '61 channels'),
+            (data * np.nan, {'sfreq': 500}, full, processed, estimator, 'NaN or Inf'),
+            (data, {'sfreq': 500}, full[:, :-1], processed, estimator, 'Full post-PCA'),
+            (data, {'sfreq': 500}, full, processed[:, :-1], estimator, 'Transformed'),
+            (data, {'sfreq': 500}, full, processed * np.nan, estimator, 'Transformed'),
+            (data, {'sfreq': 500}, full, processed, Mock(condition_shape=(999,)), 'condition shape'),
+        ]:
+            with self.assertRaisesRegex(ValueError, error):
+                infer_eeg.validate_inference_observation(bad_data, meta, bad_full, bad_processed, c, model)
+
     def test_ebrains_real_brainvision_and_window_selection(self):
         c = fixture()
         del c['channel_names']
@@ -97,7 +155,7 @@ class InferenceContracts(unittest.TestCase):
             with patch('mne.io.read_raw_brainvision', return_value=raw.copy()):
                 with self.assertRaisesRegex(ValueError, error):
                     infer_eeg.load_ebrains_epoch('test.vhdr', c, **kwargs)
-        cases = [(raw.copy().drop_channels(['C0']), 'exactly 61'),
+        cases = [(raw.copy().drop_channels(['C0']), 'requires 61'),
                  (raw.copy().reorder_channels(list(reversed(raw.ch_names))), 'names/order')]
         nonfinite = raw.copy()
         nonfinite._data[0, -1] = np.nan  # Even outside the selected window must fail.
@@ -149,8 +207,8 @@ class InferenceContracts(unittest.TestCase):
         # Exercise EBRAINS routing and artifacts, without training or GPU inference.
         c = fixture()
         del c['channel_names']
-        raw_eeg = mne.io.RawArray(np.random.default_rng(10).normal(size=(61, 4001)) * 1e-6,
-                                 mne.create_info([f'C{i}' for i in range(61)], 500, 'eeg'), verbose=False)
+        raw_eeg = mne.io.RawArray(np.random.default_rng(10).normal(size=(256, 4001)) * 1e-6,
+                                 mne.create_info([f'E{i+1}' for i in range(256)], 500, 'eeg'), verbose=False)
         samples = (c['prior_low'] + c['prior_high']).repeat(4, 1) / 2
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -158,7 +216,7 @@ class InferenceContracts(unittest.TestCase):
                 '--input-format', 'ebrains-synthetic', '--eeg-vhdr', str(tmp / 'test.vhdr'),
                 '--output-dir', str(tmp), '--num-samples', '4'])
             with patch('tvbgpu.analysis.sbi_checkpoint.load_checkpoint', return_value=c), \
-                 patch('tvbgpu.analysis.sbi_checkpoint.build_posterior', return_value=(Mock(), Mock(), Mock())), \
+                 patch('tvbgpu.analysis.sbi_checkpoint.build_posterior', return_value=(Mock(), Mock(condition_shape=(c['x_dim'],)), Mock())), \
                  patch('tvbgpu.analysis.sbi_checkpoint.draw_posteriors', return_value=samples[None]), \
                  patch('mne.io.read_raw_brainvision', return_value=raw_eeg), \
                  patch('torch.cuda.is_available', return_value=True), patch('torch.cuda.manual_seed_all'), \
@@ -168,12 +226,12 @@ class InferenceContracts(unittest.TestCase):
                 out = infer_eeg.run(args)
             self.assertEqual(extract.call_args.args[0].shape, (1, 61, 4001))
             self.assertIs(extract.call_args.args[1], c)
-            self.assertEqual(plot.call_args.args[3], infer_eeg.EBRAINS_LABEL)
+            self.assertIn('WORKSHOP/DEMO', plot.call_args.args[3])
             self.assertGreater((out / 'posterior_distributions.png').stat().st_size, 1000)
             metadata = json.loads((out / 'inference_metadata.json').read_text())
-            self.assertEqual(metadata['observation_label'], infer_eeg.EBRAINS_LABEL)
+            self.assertIn('WORKSHOP/DEMO', metadata['observation_label'])
             self.assertEqual(metadata['input_format'], 'ebrains-synthetic')
-            self.assertEqual(metadata['eeg']['channel_order_source'], 'ebrains_brainvision_order_assumed')
+            self.assertEqual(metadata['eeg']['channel_order_source'], 'approximate_evenly_spaced_indices')
             np.testing.assert_array_equal(np.load(out / 'posterior_samples.npy'), samples.numpy())
 
     def test_brainvision_crop_and_epoch_dimension(self):
@@ -278,7 +336,7 @@ class InferenceContracts(unittest.TestCase):
             # Exercise orchestration/output only; explicitly stub GPU extraction, not sampling.
             args= infer_eeg.parse_args(['--checkpoint', str(model), '--eeg', str(tmp / 'external-epo.fif'),
                                       '--output-dir', str(tmp),'--epoch-index','0','--num-samples','20'])
-            with patch.object(infer_eeg, 'load_epoch', return_value=(None, {'condition': 'EO'})), \
+            with patch.object(infer_eeg, 'load_epoch', return_value=(np.zeros((1, 61, 600)), {'condition': 'EO', 'sfreq': 500.0})), \
                  patch.object(infer_eeg, 'extract_observation', return_value=(np.zeros((1, c['x_full_dim'])), c['xs'][:1].numpy())), \
                  patch('torch.cuda.is_available',return_value=True), patch('torch.cuda.manual_seed_all'):
                 out= infer_eeg.run(args)

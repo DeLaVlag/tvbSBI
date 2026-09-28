@@ -76,20 +76,51 @@ explicit EBRAINS mode below instead.
 ## EBRAINS Days: synthetic TVB EEG, sub-001
 
 `--input-format ebrains-synthetic --eeg-vhdr PATH` reads BrainVision sensor-space
-EEG with MNE, which resolves the accompanying `.eeg` and `.vmrk` files. Exactly
-61 EEG channels, finite data, unique channel names, and no unresolved bad channels
-are required. No projection is applied to observed EEG. The JSON and electrodes
+EEG with MNE, which resolves the accompanying `.eeg` and `.vmrk` files. Finite data,
+unique channel names, no unresolved bad channels, and at least the checkpoint's
+required channel count are required. No projection is applied to observed EEG. The JSON and electrodes
 sidecars are not needed by this endpoint; no montage or reference is inferred.
 
-BrainVision channel order is preserved and printed. When checkpoint channel names
+BrainVision channel order is preserved and printed for approximate selection. When checkpoint channel names
 are absent, no external manifest is required in this mode. A prominent warning
 records the assumption that these sensors correspond to the checkpoint's
 observation space. Saved checkpoint names or an explicitly supplied
-`--channel-order` still must match exactly. All other checkpoint compatibility
-checks remain unchanged.
+`--channel-order` still must match exactly for equal-size recordings. Larger inputs
+are selected in saved/manifest order when all those names are available. An explicit
+manifest with missing names is rejected. All other checkpoint compatibility checks
+remain unchanged.
 
-MNE resamples the continuous recording to `feature_config.fs` when necessary,
-before window selection. The window length uses saved `preprocessing_config.n_times`
+For the 256-channel `E1`…`E256` recording without verified correspondence, selection
+is explicitly **approximate workshop/demo inference**, never anatomical equivalence.
+If MNE provides finite, nonzero, unique, non-collinear coordinates for every channel,
+the loader uses deterministic Euclidean farthest-point sampling: start farthest from
+the coordinate centroid, then repeatedly choose the point farthest from its nearest
+selected point. Ties use the lowest original index. The result is sorted into
+original acquisition order. This spreads sensors spatially but does not align them
+to the training montage. No standard montage is guessed from generic `E` names.
+
+Without usable coordinates, selection is
+`np.rint(np.linspace(0, 255, 61)).astype(int)` for this input/checkpoint. It includes
+both endpoints and produces 61 unique indices. This covers the channel index range;
+it cannot guarantee scalp coverage. Original indices, selected channel names, method,
+and the approximation warning are logged and recorded in metadata. The plot title
+also marks approximate runs as WORKSHOP/DEMO. Inputs smaller than the required
+channel count are rejected without padding.
+
+The current trainer uses **61 sensors at 500 Hz**. Its full feature order is:
+DFA (61), LYA (61), FC PCA (20), DFA log-F curve PCA (10), LYA curve PCA (10),
+PLI PCA (20), AECC PCA (20), alpha summaries (5): **207 total**. Saved PCA input
+widths and channel-specific DFA/LYA features make channel count/order matter even
+though the neural posterior only receives the final vector. For example, the
+connectivity PCA inputs contain `61*60/2 = 1830` upper-triangle entries.
+Training computes the near-constant mask using
+`std > 1e-6 * max(median(abs(feature)), 1)`; inference reuses the saved mask rather
+than recomputing this reference scale from the observation. Saved PCA, feature
+names/slices, `feature_keep`, `x_mean`, and `x_std` remain authoritative.
+
+MNE resamples the selected continuous recording to saved `feature_config.fs` when necessary,
+before window selection (e.g. 256.016 → 500 Hz, or → 200 Hz if the checkpoint
+explicitly specifies 200). The window length uses saved `preprocessing_config.n_times`
 when present. Otherwise `--window-samples` can supply the verified training length;
 the workshop fallback is **4001 samples**, with a warning that the checkpoint
 does not verify this assumption. An override cannot contradict saved `n_times`.
