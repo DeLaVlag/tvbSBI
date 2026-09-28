@@ -138,6 +138,7 @@ class InferenceContracts(unittest.TestCase):
         args = infer_eeg.parse_args(base + ebrains)
         self.assertEqual(args.eeg, Path('test.vhdr'))
         self.assertEqual(args.epoch_index, 0)
+        self.assertEqual(infer_eeg.parse_args(['--checkpoint', 'model.pt'] + ebrains).output_dir, Path('.'))
         self.assertEqual(infer_eeg.parse_args(base + ['--eeg', 'test-epo.fif']).input_format, 'auto')
         for extra in (['--condition', 'EO'], ['--dk-atlas', 'atlas.tsv'],
                       ['--eeg', 'other.vhdr'], ['--window-samples', '500']):
@@ -155,7 +156,7 @@ class InferenceContracts(unittest.TestCase):
             tmp = Path(tmp)
             args = infer_eeg.parse_args(['--checkpoint', str(tmp / 'model.pt'),
                 '--input-format', 'ebrains-synthetic', '--eeg-vhdr', str(tmp / 'test.vhdr'),
-                '--output-dir', str(tmp / 'results'), '--num-samples', '4'])
+                '--output-dir', str(tmp), '--num-samples', '4'])
             with patch('tvbgpu.analysis.sbi_checkpoint.load_checkpoint', return_value=c), \
                  patch('tvbgpu.analysis.sbi_checkpoint.build_posterior', return_value=(Mock(), Mock(), Mock())), \
                  patch('tvbgpu.analysis.sbi_checkpoint.draw_posteriors', return_value=samples[None]), \
@@ -276,7 +277,7 @@ class InferenceContracts(unittest.TestCase):
             self.assertGreater((tmp/'plot.png').stat().st_size,1000)
             # Exercise orchestration/output only; explicitly stub GPU extraction, not sampling.
             args= infer_eeg.parse_args(['--checkpoint', str(model), '--eeg', str(tmp / 'external-epo.fif'),
-                                      '--output-dir', str(tmp/'results'),'--epoch-index','0','--num-samples','20'])
+                                      '--output-dir', str(tmp),'--epoch-index','0','--num-samples','20'])
             with patch.object(infer_eeg, 'load_epoch', return_value=(None, {'condition': 'EO'})), \
                  patch.object(infer_eeg, 'extract_observation', return_value=(np.zeros((1, c['x_full_dim'])), c['xs'][:1].numpy())), \
                  patch('torch.cuda.is_available',return_value=True), patch('torch.cuda.manual_seed_all'):

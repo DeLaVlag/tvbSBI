@@ -158,7 +158,9 @@ python -m tvbgpu.infer_eeg \
 
 These are input-path templates: compatible checkpoints, prepared EEG and the
 verified manifest must be supplied. Use `--device cpu` for CPU posterior sampling.
-The output directory must be new. Fixed seeds initialize Python, NumPy and Torch;
+`--output-dir` is optional and defaults to the current directory. Any supplied
+directory must already exist; the script creates no output directories. Repeated
+runs overwrite the six result files listed below. Fixed seeds initialize Python, NumPy and Torch;
 bitwise reproducibility across GPU/software versions is not guaranteed. Exit codes:
 0 success, 1 runtime/compatibility failure with traceback, 2 CLI usage error.
 
@@ -201,7 +203,7 @@ python tests/smoke_infer_eeg.py \
   --output-dir output/workshop_smoke --num-samples 20 --device cpu --seed 42
 ```
 
-Repeat with the compatible full checkpoint and a different output directory.
+Repeat with the compatible full checkpoint and a different existing output directory.
 This invokes actual loading, extraction, transforms, sampling and all outputs;
 20 samples exercise execution only, not scientifically meaningful uncertainty.
 

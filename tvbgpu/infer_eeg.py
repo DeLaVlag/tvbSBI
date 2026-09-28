@@ -282,7 +282,8 @@ def parse_args(argv=None):
     parser.add_argument("--connectivity-distances", type=Path)
     parser.add_argument("--window-samples", type=int,
                         help="EBRAINS window length after resampling; saved n_times takes precedence, otherwise 4001")
-    parser.add_argument("--output-dir", required=True, type=Path, help="New result directory")
+    parser.add_argument("--output-dir", default=Path("."), type=Path,
+                        help="Existing result directory (default: current directory); result files are overwritten")
     parser.add_argument("--epoch-index", default=0, type=int,
                         help="Zero-based epoch/window index (default: 0; non-EBRAINS BrainVision requires 0)")
     parser.add_argument("--condition", help="Exact MNE event_id label, e.g. EO or EC")
@@ -316,8 +317,9 @@ def run(args):
     import torch
     from tvbgpu.analysis.sbi_checkpoint import load_checkpoint, build_posterior, draw_posteriors, MCMC_PARAMETERS
     from tvbgpu.analysis.posterior_validation import parameter_metadata
-    if args.output_dir.exists():
-        raise ValueError("Output directory already exists; choose a new directory")
+    out = args.output_dir.resolve()
+    if not out.is_dir():
+        raise ValueError(f"Output directory does not exist: {out}; choose an existing directory")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -369,8 +371,6 @@ def run(args):
     samples = draw_posteriors(posterior, observation, args.num_samples)[0].numpy()
     rows = summarize(samples, names, low, high)
     timings["posterior_sampling_seconds"] = time.perf_counter() - tick
-    out = args.output_dir.resolve()
-    out.mkdir(parents=True, exist_ok=False)
     np.save(out / "posterior_samples.npy", samples)
     np.save(out / "eeg_features_raw.npy", raw)
     np.save(out / "eeg_features_processed.npy", processed)
