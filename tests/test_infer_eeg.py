@@ -52,6 +52,35 @@ def fixture():
 
 
 class InferenceContracts(unittest.TestCase):
+    def test_training_distribution_check_mask_mapping(self):
+        boundaries = [0, 61, 122, 142, 152, 162, 182, 202, 207]
+        slices = dict(zip(sf.POST_PCA_BLOCK_ORDER, zip(boundaries[:-1], boundaries[1:])))
+        for removed in ([], [0, 60, 121, 141, 151, 161, 181, 201]):
+            keep = np.ones(207, dtype=bool)
+            keep[removed] = False
+            full = np.zeros(207)
+            full[[1, 61, 122, 142, 152, 162, 182, 202, 203, 204, 205]] = [3, -5, 10, -11, 12, -13, 14, -15, 16, -17, 18]
+            z = full[keep][None, :]
+            before = z.copy()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                diagnostic = infer_eeg.training_distribution_check(z, dict(
+                    feature_keep=keep, feature_block_slices=slices))
+            np.testing.assert_array_equal(z, before)
+            self.assertEqual(diagnostic['features'], int(keep.sum()))
+            self.assertEqual(diagnostic['counts_abs_z_gt'], {'3': 10, '5': 9, '10': 8})
+            self.assertEqual(diagnostic['max_abs_z'], 18)
+            self.assertEqual(diagnostic['median_abs_z'], 0)
+            self.assertAlmostEqual(diagnostic['mean_abs_z'], np.abs(z).mean())
+            self.assertEqual(len(diagnostic['top_features']), 10)
+            for row in diagnostic['top_features']:
+                index = row['feature_index']
+                self.assertEqual(row['z_score'], full[index])
+                self.assertEqual(np.flatnonzero(keep)[row['retained_index']], index)
+                start, stop = slices[row['feature_block']]
+                self.assertTrue(start <= index < stop)
+            self.assertIn('[TRAINING DISTRIBUTION CHECK]', output.getvalue())
+            json.dumps(diagnostic, allow_nan=False)
+
     def test_ebrains_256_channel_fallback_and_saved_rate(self):
         c = fixture()
         del c['channel_names']
@@ -281,6 +310,8 @@ class InferenceContracts(unittest.TestCase):
             metadata = json.loads((out / 'inference_metadata.json').read_text())
             self.assertIn('WORKSHOP/DEMO', metadata['observation_label'])
             self.assertEqual(metadata['input_format'], 'ebrains-synthetic')
+            self.assertEqual(metadata['training_distribution_check']['features'], c['x_dim'])
+            self.assertEqual(metadata['training_distribution_check']['max_abs_z'], 0.0)
             self.assertEqual(metadata['eeg']['channel_order_source'], 'approximate_evenly_spaced_indices')
             np.testing.assert_array_equal(np.load(out / 'posterior_samples.npy'), samples.numpy())
 

@@ -407,6 +407,38 @@ def summarize(samples, names, low, high):
     return rows
 
 
+def training_distribution_check(observation, checkpoint):
+    """Summarize already-standardized posterior input without changing it."""
+    import numpy as np
+    z = np.asarray(observation, dtype=np.float64).reshape(-1)
+    absolute = np.abs(z)
+    original_indices = np.flatnonzero(np.asarray(checkpoint['feature_keep'], dtype=bool))
+    top = []
+    for retained_index in np.argsort(-absolute, kind='stable')[:10]:
+        original_index = int(original_indices[retained_index])
+        block = next(name for name, (start, stop) in checkpoint['feature_block_slices'].items()
+                     if start <= original_index < stop)
+        top.append(dict(feature_index=original_index, retained_index=int(retained_index),
+                        feature_block=block, z_score=float(z[retained_index])))
+    counts = {str(threshold): int(np.count_nonzero(absolute > threshold)) for threshold in (3, 5, 10)}
+    diagnostic = dict(features=int(z.size), mean_abs_z=float(absolute.mean()),
+                      median_abs_z=float(np.median(absolute)), max_abs_z=float(absolute.max()),
+                      counts_abs_z_gt=counts, top_features=top,
+                      feature_index_convention="zero-based original full feature index before feature_keep",
+                      normalization="already-normalized posterior input; no additional normalization")
+    print(f"[TRAINING DISTRIBUTION CHECK]\nFeatures: {z.size}\n"
+          f"Mean |z|: {diagnostic['mean_abs_z']:.6g}\n"
+          f"Median |z|: {diagnostic['median_abs_z']:.6g}\n"
+          f"Max |z|: {diagnostic['max_abs_z']:.6g}", flush=True)
+    for threshold, count in counts.items():
+        print(f"|z| > {threshold}: {count}")
+    print("Largest |z| (zero-based original feature index; retained input index in parentheses):")
+    for row in top:
+        print(f"  {row['feature_index']:3d} ({row['retained_index']:3d})  "
+              f"{row['feature_block']:16s} z={row['z_score']:+.6g}", flush=True)
+    return diagnostic
+
+
 def validate_inference_observation(data, eeg_metadata, full, processed, checkpoint, estimator):
     """Fail before MCMC if the observation violates the saved feature contract."""
     import numpy as np
@@ -496,9 +528,8 @@ def run(args):
     import torch
     from tvbgpu.analysis.sbi_checkpoint import load_checkpoint, build_posterior, draw_posteriors, MCMC_PARAMETERS
     from tvbgpu.analysis.posterior_validation import parameter_metadata
-    out = args.output_dir.resolve()
-    if not out.is_dir():
-        raise ValueError(f"Output directory does not exist: {out}; choose an existing directory")
+    out = args.output_dir
+    out.mkdir(parents=True, exist_ok=True)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -551,6 +582,7 @@ def run(args):
     observation = torch.as_tensor(processed, dtype=torch.float32, device=args.device)
     if not torch.isfinite(observation).all():
         raise ValueError("Observation contains NaN/Inf after conversion to posterior float32 input")
+    distribution_check = training_distribution_check(observation.detach().cpu().numpy(), checkpoint)
     samples = draw_posteriors(posterior, observation, args.num_samples)[0].numpy()
     rows = summarize(samples, names, low, high)
     timings["posterior_sampling_seconds"] = time.perf_counter() - tick
@@ -581,6 +613,7 @@ def run(args):
     metadata = dict(output_format_version=1, checkpoint=str(args.checkpoint.resolve()),
                     input_format=args.input_format, observation_label=observation_label,
                     connectivity=connectivity_metadata,
+                    training_distribution_check=distribution_check,
                     checkpoint_type="trainer_density_estimator", checkpoint_format_version=checkpoint.get("checkpoint_version"),
                     eeg_input=str(args.eeg.resolve()), eeg=eeg_metadata, num_samples=args.num_samples,
                     device=args.device, feature_device="cuda", seed=args.seed, parameter_names=names,
