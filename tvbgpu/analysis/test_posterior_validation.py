@@ -228,7 +228,8 @@ class OrchestrationValidation(unittest.TestCase):
                     "x_raw_full": np.ones((len(theta), 9))}
         self.ns["_resimulate_features"] = resim
         self.ns["resimulation_consistency_test"] = lambda *args, **kwargs: {
-            "x_resim": np.zeros((2, 8)), "mean_diff": torch.tensor(1.), "median_diff": torch.tensor(1.)}
+            "x_resim": np.zeros((2, 8)), "diffs": np.ones(2),
+            "mean_diff": torch.tensor(1.), "median_diff": torch.tensor(1.)}
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "checkpoint-marker"
             marker.write_text("CPU test fixture; no checkpoint is loaded")

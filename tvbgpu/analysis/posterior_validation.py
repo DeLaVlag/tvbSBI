@@ -369,3 +369,101 @@ def report_result(test, result, names, feature_names, blocks):
                 print("[BLOCK SENSITIVITY]", block, "n_features", values["n_features"],
                       "mean_L2", values["mean_l2"][j], "median_L2", values["median_l2"][j],
                       "mean_RMS", values["mean_rms"][j], "mean_delta_noise_L2", values["mean_delta_noise_l2"][j])
+
+
+def json_values(value):
+    """Convert small numeric summaries/configuration to ordinary JSON values."""
+    return json.loads(json.dumps(value, default=lambda x: as_numpy(x).tolist(), allow_nan=False))
+
+
+def file_sha256(path):
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def transform_signal_blocks(blocks, checkpoint):
+    from .sbi_features import post_pca_blocks, assemble_post_pca, apply_saved_transform
+    models = {out: checkpoint[key] for out, key in (
+        ('fc_pca', 'fcpca'), ('dfa_curve_pca', 'dfa_pca'), ('lya_curve_pca', 'lya_pca'),
+        ('pli_pca', 'pli_pca'), ('aecc_pca', 'aecc_pca'))}
+    full, names, _ = assemble_post_pca(post_pca_blocks(blocks, models))
+    if names != list(checkpoint['feature_names_full']):
+        raise ValueError('Shared inputs: transformed feature order mismatch')
+    return require_finite('shared normalized features', apply_saved_transform(full, checkpoint))
+
+
+def shared_inputs(path, checkpoint, model_path, simulator_args, n, seed, simulate):
+    """Create once/reuse pre-PCA observations in the existing test entry point.
+
+    Checkpoints only retain post-PCA training features. Fresh observations at
+    saved training theta permit each posterior to apply its own fitted PCA.
+    The first checkpoint supplies common scoring transforms and baseline rows.
+    """
+    parameter_metadata(checkpoint)
+    path = Path(path)
+    contract = json_values({key: checkpoint.get(key) for key in (
+        'parameter_names', 'prior_low', 'prior_high', 'feature_pipeline_version',
+        'feature_config', 'preprocessing_config', 'signal_block_order')})
+    contract.update(simulator_args=json_values(simulator_args), seed=seed, n_cases=n)
+    if path.exists():
+        with np.load(path, allow_pickle=False) as saved:
+            metadata = json.loads(str(saved['metadata']))
+            for key, value in contract.items():
+                if metadata.get(key) != value:
+                    raise ValueError(f'Shared inputs mismatch: {key}; use identical settings or a new file')
+            theta, indices = saved['theta_true'], saved['indices']
+            signal = {key: saved[key] for key in checkpoint['signal_block_order']}
+        reference_path = metadata['reference_checkpoint']
+        if file_sha256(reference_path) != metadata['reference_sha256']:
+            raise ValueError('Shared inputs: reference checkpoint changed')
+        from .sbi_checkpoint import load_checkpoint
+        reference = load_checkpoint(reference_path)
+    else:
+        if n > len(checkpoint['thetas']):
+            raise ValueError('Shared inputs require at least the requested number of training rows')
+        indices = np.random.default_rng(seed).permutation(len(checkpoint['thetas']))[:n]
+        theta = as_numpy(checkpoint['thetas'])[indices]
+        signal = simulate(theta)
+        if not np.all(signal['alpha_valid']):
+            raise ValueError('Shared observations contain invalid alpha features')
+        metadata = dict(contract, reference_checkpoint=str(Path(model_path).resolve()),
+                        reference_sha256=file_sha256(model_path))
+        reference = checkpoint
+    if theta.shape != (n, len(PARAMETER_ORDER)) or indices.shape != (n,):
+        raise ValueError('Shared inputs: theta/index shape mismatch')
+    if not np.array_equal(theta, as_numpy(reference['thetas'])[indices]):
+        raise ValueError('Shared inputs: theta differs from reference training rows')
+    require_finite('shared theta', theta)
+    for key in checkpoint['signal_block_order']:
+        if signal[key].ndim != 2 or len(signal[key]) != n:
+            raise ValueError(f'Shared inputs: invalid feature block {key}')
+        require_finite(key, signal[key])
+    model_x = transform_signal_blocks(signal, checkpoint)
+    reference_x = transform_signal_blocks(signal, reference)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive creation prevents concurrent first runs overwriting observations.
+        with path.open('xb') as stream:
+            np.savez_compressed(stream, theta_true=theta, indices=indices,
+                                metadata=json.dumps(metadata), **signal)
+    return dict(theta_true=theta, indices=indices, model_x=model_x, reference_x=reference_x,
+                metadata=metadata, sha256=file_sha256(path)), reference
+
+
+def compact_test_result(test, result, samples):
+    keys = ('diffs', 'mean_diff', 'median_diff') if test == 'consistency' else (
+        'distances', 'baseline_distances', 'posterior_summary', 'baseline_summary',
+        'per_observation_mean', 'per_observation_median')
+    # Retain every case and draw; do not silently summarize nonfinite distances.
+    require_finite(test + ' distances', result['diffs' if test == 'consistency' else 'distances'])
+    return json_values(dict(samples=samples, **{key: result[key] for key in keys},
+                            theta_true=result['theta_true'], observation_indices=result['observation_indices'],
+                            x_target=result['x_target']))
+
+
+def write_comparison(directory, comparison):
+    (Path(directory) / 'comparison.json').write_text(json.dumps(json_values(comparison), indent=2) + '\n')

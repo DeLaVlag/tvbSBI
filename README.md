@@ -43,6 +43,10 @@ training output. Participant and full models use the same checkpoint schema.
 
 ## Quick validation
 
+For a small/full comparison of the existing consistency and predictive tests,
+see [the workshop comparison](docs/posterior_validation_comparison.md). Add the same
+`--shared-inputs` path to both runs, then plot their compact JSON summaries.
+
 ```bash
 bash scripts/posterior_validation.sh CHECKPOINT TRAIN_N_TIME TRAIN_DT
 ```

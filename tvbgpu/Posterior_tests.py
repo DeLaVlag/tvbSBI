@@ -56,7 +56,7 @@ def run_tvb_gpu(params_to_simulate, comm, logger):
 @torch.no_grad()
 def compute_features(
     tavg, fcpca, dfa_pca, lya_pca, pli_pca, aecc_pca,
-    precuneus_idx, acc_idx, dmn_idx, fs=500.0, device="cuda", config=None,
+    precuneus_idx, acc_idx, dmn_idx, fs=500.0, device="cuda", config=None, return_signal=False,
 ):
     """Apply the canonical EEG feature path and already-fitted PCA objects.
 
@@ -74,6 +74,8 @@ def compute_features(
             dmn_idx=tuple(dmn_idx),
         )
     signal_blocks = extract_signal_features(tavg, config, logger, comm.Get_rank())
+    if return_signal:
+        return signal_blocks
     pca_models = {
         "fc_pca": fcpca, "dfa_curve_pca": dfa_pca,
         "lya_curve_pca": lya_pca, "pli_pca": pli_pca,
@@ -141,7 +143,7 @@ def parameter_recovery_test(posterior, thetas, xs, prior, n_samples=200,
 
 
 @torch.no_grad()
-def _resimulate_features(theta, checkpoint, simulation_batch_size=256):
+def _resimulate_features(theta, checkpoint, simulation_batch_size=256, return_signal=False):
     """Batched simulator input is physical theta; returned features use saved scaling.
 
     theta: (draws, 7) in checkpoint coordinates. Only noise is exponentiated,
@@ -157,7 +159,7 @@ def _resimulate_features(theta, checkpoint, simulation_batch_size=256):
     if simulation_batch_size < 1:
         raise ValueError("simulation_batch_size must be positive")
     config = FeatureConfig(**checkpoint["feature_config"])
-    full_parts, normalized_parts = [], []
+    full_parts, normalized_parts, signal_parts = [], [], []
     for start in range(0, len(theta), simulation_batch_size):
         physical = theta[start:start + simulation_batch_size].copy()
         physical[:, names.index("log10_weight_noise")] = 10.0 ** physical[:, names.index("log10_weight_noise")]
@@ -167,7 +169,12 @@ def _resimulate_features(theta, checkpoint, simulation_batch_size=256):
             eeg, checkpoint["fcpca"], checkpoint["dfa_pca"], checkpoint["lya_pca"],
             checkpoint["pli_pca"], checkpoint["aecc_pca"],
             config.precuneus_idx, config.acc_idx, config.dmn_idx, config=config,
+            **({"return_signal": True} if return_signal else {}),
         )
+        if return_signal:
+            signal_parts.append(full)
+            del eeg
+            continue
         if full.shape[0] != len(physical):
             raise ValueError("Simulator/feature extraction changed the number of rows")
         validation.require_finite("x_raw_full", full)
@@ -176,6 +183,8 @@ def _resimulate_features(theta, checkpoint, simulation_batch_size=256):
         full_parts.append(full)
         normalized_parts.append(normalized)
         del eeg
+    if return_signal:
+        return {key: np.concatenate([part[key] for part in signal_parts]) for key in signal_parts[0]}
     full = np.concatenate(full_parts)
     normalized = np.concatenate(normalized_parts)
     return {"x_raw_full": full, "x_raw": full[:, checkpoint["feature_keep"]],
@@ -185,10 +194,10 @@ def _resimulate_features(theta, checkpoint, simulation_batch_size=256):
 @torch.no_grad()
 def posterior_predictive_check(posterior, xs, checkpoint, target_indices,
                                n_theta_samples=20, max_items=10,
-                               simulation_batch_size=256, seed=42):
+                               simulation_batch_size=256, seed=42, conditioning_xs=None):
     """Resimulate individual posterior draws, then compare to unrelated saved rows."""
     xs, target_indices = xs[:max_items], np.asarray(target_indices)[:max_items]
-    draws = _draw_posteriors(posterior, xs, n_theta_samples)
+    draws = _draw_posteriors(posterior, xs if conditioning_xs is None else conditioning_xs[:max_items], n_theta_samples)
     n, k, p = draws.shape
     resim = _resimulate_features(draws.reshape(n * k, p), checkpoint, simulation_batch_size)
     blocks = validation.feature_block_indices(checkpoint)
@@ -263,6 +272,7 @@ def resimulation_consistency_test(
     n_samples=200,
     max_items=5,
     device="cuda",
+    conditioning_xs=None,
 ):
     """
     Posterior-mean resimulation consistency test with diagnostics.
@@ -472,7 +482,7 @@ def resimulation_consistency_test(
     theta_means = []
     theta_samples_all = []
 
-    for i, x_i in enumerate(xs_test):
+    for i, x_i in enumerate(xs_test if conditioning_xs is None else conditioning_xs[:max_items]):
         print(f"[DIAG] Sampling posterior for item {i}", flush=True)
 
         theta_samples = posterior.sample(
@@ -1046,6 +1056,7 @@ def parse_validation_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter, allow_abbrev=False,
     )
     parser.add_argument("--checkpoint", default="tvbgpu/output/sbi_full.pt", metavar="PATH")
+    parser.add_argument("--shared-inputs", metavar="NPZ", help="Create/reuse shared observations for consistency,predictive")
     parser.add_argument("--tests", default="consistency", help="Comma-separated test names or all: " + ",".join(TEST_TITLES))
     parser.add_argument("--output-dir", help="New result directory; default: validation_JOBID_TIMESTAMP in the working directory")
     parser.add_argument("--seed", type=int, default=42, help="Training-row/baseline selection and posterior RNG seed; simulator RNG unchanged")
@@ -1074,6 +1085,8 @@ def parse_validation_args(argv=None):
     if not selected or any(x not in TEST_TITLES for x in selected) or len(set(selected)) != len(selected):
         parser.error("--tests must be all or unique comma-separated names: " + ",".join(TEST_TITLES))
     args.tests = selected
+    if args.shared_inputs and any(test not in ("consistency", "predictive") for test in selected):
+        parser.error("--shared-inputs supports --tests consistency,predictive only")
     for key, value in vars(args).items():
         if key.endswith(("_items", "_samples", "_repeats")) or key in ("n_time", "simulation_batch_size", "sensitivity_top_features"):
             if value < 1:
@@ -1146,20 +1159,32 @@ def main():
     print(f"[STARTUP] feature pipeline={checkpoint['feature_pipeline_version']} "
           f"retained/full={len(checkpoint['feature_names'])}/{len(checkpoint['feature_names_full'])}", flush=True)
     print("[STARTUP] saved normalization reconstruction:", normalization_check, flush=True)
-    print("[STARTUP] Training-pair diagnostics are in-sample, not held-out calibration or independent SBC.", flush=True)
-    print("[STARTUP] Consistency uses the first saved rows; other tests use a seeded random subset.", flush=True)
+    if not args.shared_inputs:
+        print("[STARTUP] Training-pair diagnostics are in-sample, not held-out calibration or independent SBC.", flush=True)
+        print("[STARTUP] Consistency uses the first saved rows; other tests use a seeded random subset.", flush=True)
     print("[STARTUP] Existing MCMC settings retained: 2 chains, 20 warmup steps, thin=1, resample initialization.", flush=True)
+
+    shared = None
+    scoring_checkpoint = checkpoint
+    if args.shared_inputs:
+        shared, scoring_checkpoint = validation.shared_inputs(
+            args.shared_inputs, checkpoint, model, vars(simulator_args),
+            max(getattr(args, test + "_items") for test in args.tests), args.seed,
+            lambda theta: _resimulate_features(theta, checkpoint, args.simulation_batch_size, return_signal=True),
+        )
+        blocks = validation.feature_block_indices(scoring_checkpoint)
+        print("[STARTUP] Shared observations; scores use the first run's checkpoint transforms.")
 
     counts = {}
     for test in args.tests:
         requested = getattr(args, test + "_items")
-        counts[test] = {"requested_items": requested, "items": min(requested, len(xs))}
+        counts[test] = {"requested_items": requested, "items": requested if shared is not None else min(requested, len(xs))}
         if test == "sensitivity":
             counts[test].update(repeats=args.sensitivity_repeats, eps=args.sensitivity_eps)
         else:
             counts[test]["samples"] = getattr(args, test + "_samples")
         print(f"[STARTUP] {test}: {counts[test]}", flush=True)
-    if "predictive" in args.tests and args.predictive_samples > len(xs) - 1:
+    if "predictive" in args.tests and args.predictive_samples > len(scoring_checkpoint["xs"]) - 1:
         raise ValueError("Predictive baseline requires at least predictive_samples+1 saved rows")
     print(f"[STARTUP] GPU simulation batch size={args.simulation_batch_size}", flush=True)
 
@@ -1179,9 +1204,9 @@ def main():
         "checkpoint_mtime_ns": os.stat(model).st_mtime_ns, "started_utc": stamp,
         "checkpoint_feature_pipeline_version": checkpoint["feature_pipeline_version"],
         "parameter_names": names, "prior_low": low, "prior_high": high,
-        "feature_names": checkpoint["feature_names"], "feature_names_full": checkpoint["feature_names_full"],
-        "feature_keep": checkpoint["feature_keep"], "feature_block_indices": blocks,
-        "feature_block_slices": checkpoint["feature_block_slices"],
+        "feature_names": scoring_checkpoint["feature_names"], "feature_names_full": scoring_checkpoint["feature_names_full"],
+        "feature_keep": scoring_checkpoint["feature_keep"], "feature_block_indices": blocks,
+        "feature_block_slices": scoring_checkpoint["feature_block_slices"],
         "feature_config": checkpoint["feature_config"], "normalization_check": normalization_check,
         "simulator_args": vars(simulator_args), "validation_args": vars(args),
         "sample_counts": counts, "versions": versions, "source_file": os.path.realpath(__file__),
@@ -1191,31 +1216,47 @@ def main():
         "seed_scope": "Row/baseline selection and posterior RNG; simulator RNG unchanged",
         "results": {},
     }
+    if shared is not None:
+        manifest["observation_source"] = "Shared fresh simulations at first checkpoint training theta; not held-out parameter recovery"
+        manifest["scoring_reference"] = shared["metadata"]
+        manifest["shared_inputs_sha256"] = shared["sha256"]
     validation.save_result(output_dir, "manifest", manifest)
+    comparison = {"checkpoint": model, "training_simulations": len(thetas),
+                  "seed": args.seed, "simulator_args": vars(simulator_args),
+                  "shared_inputs_sha256": shared["sha256"] if shared else None,
+                  "reference_sha256": shared["metadata"]["reference_sha256"] if shared else None,
+                  "tests": {}}
     order = np.random.default_rng(args.seed).permutation(len(xs))
     # Match the existing combined basic test's reuse of posterior samples when
     # observation/sample counts coincide, while retaining independent CLI counts.
     sample_cache = {}
-    cfg = checkpoint["feature_config"]
+    cfg = scoring_checkpoint["feature_config"]
     for test in args.tests:
         print("\n" + "=" * 70 + "\n" + TEST_TITLES[test] + "\n" + "=" * 70, flush=True)
         started = time.monotonic()
         torch.manual_seed(args.seed)
         n = counts[test]["items"]
         indices = np.arange(n) if test == "consistency" else order[:n]
-        ix = torch.as_tensor(indices, dtype=torch.long, device=xs.device)
-        target_x, target_theta = xs[ix], thetas[ix]
+        if shared is None:
+            ix = torch.as_tensor(indices, dtype=torch.long, device=xs.device)
+            target_x, target_theta = xs[ix], thetas[ix]
+        conditioning = {}
+        if shared is not None:
+            indices = shared["indices"][:n]
+            target_theta = shared["theta_true"][:n]
+            target_x = torch.as_tensor(shared["reference_x"][:n], dtype=torch.float32, device=device)
+            conditioning["conditioning_xs"] = torch.as_tensor(shared["model_x"][:n], dtype=torch.float32, device=device)
         try:
             if test == "consistency":
                 result = resimulation_consistency_test(
-                    posterior, target_x, mean, std, checkpoint,
+                    posterior, target_x, scoring_checkpoint["x_mean"], scoring_checkpoint["x_std"], scoring_checkpoint,
                     cfg["precuneus_idx"], cfg["acc_idx"], cfg["dmn_idx"],
-                    n_samples=args.consistency_samples, max_items=n, device=device,
+                    n_samples=args.consistency_samples, max_items=n, device=device, **conditioning,
                 )
             elif test == "predictive":
                 result = posterior_predictive_check(
-                    posterior, target_x, checkpoint, indices, args.predictive_samples, n,
-                    args.simulation_batch_size, args.seed,
+                    posterior, target_x, scoring_checkpoint, indices, args.predictive_samples, n,
+                    args.simulation_batch_size, args.seed, **conditioning,
                 )
             elif test == "sensitivity":
                 result = feature_sensitivity_test(
@@ -1236,19 +1277,22 @@ def main():
                 else:
                     result = coverage_test(posterior, target_theta, target_x, n_samples=count,
                                            levels=[0.50, 0.80, 0.90, 0.95], samples=samples)
-            result.update(observation_indices=indices, x_target=validation.as_numpy(target_x),
+            result.update(observation_indices=indices, theta_true=validation.as_numpy(target_theta), x_target=validation.as_numpy(target_x),
                           elapsed_seconds=time.monotonic() - started)
             # Save before printing: preserve expensive results even if reporting fails.
             validation.save_result(output_dir, test, result)
             manifest["results"][test] = {"status": "completed", "json": f"{test}.json", "npz": f"{test}.npz",
                                           "elapsed_seconds": result["elapsed_seconds"]}
             validation.save_result(output_dir, "manifest", manifest)
-            validation.report_result(test, result, names, checkpoint["feature_names"], blocks)
+            validation.report_result(test, result, names, scoring_checkpoint["feature_names"], blocks)
             print(f"[SAVED] {test}.json and {test}.npz", flush=True)
             if test == "consistency":
                 if result["x_resim"] is None:
                     raise ValueError("Posterior-mean consistency did not produce resimulation features")
                 validation.require_finite("consistency x_resim", result["x_resim"])
+            if test in ("consistency", "predictive"):
+                comparison["tests"][test] = validation.compact_test_result(test, result, counts[test]["samples"])
+                validation.write_comparison(output_dir, comparison)
             del result
         except Exception as exc:
             manifest["results"][test] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}

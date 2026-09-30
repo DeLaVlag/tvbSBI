@@ -286,3 +286,60 @@ near-zero feature timing is not a performance measurement. Separate tests read
 real temporary MNE FIF epochs and validate saved PCA/mask/scaling. These figures
 must not be used to promise workshop runtime; actual GPU EEG timings remain
 unmeasured.
+
+## Compare workshop and full posterior outputs
+
+`python -m tvbgpu.compare_posteriors SMALL_DIR FULL_DIR` reads each run's
+`posterior_samples.npy` and `inference_metadata.json`. It does not load a checkpoint,
+train a model, recompute EEG features, or sample a posterior. It runs on CPU.
+
+For the two JUSUF runs, assuming the project output directory is `tvbgpu/output`,
+run from the repository root:
+
+```bash
+python -m tvbgpu.compare_posteriors \
+  tvbgpu/output/ebrains_sub001 \
+  tvbgpu/output/ebrains_sub001_full_posterior \
+  --expected-full-checkpoint sbi_full.pt \
+  --full-label 'Full pretrained model (131072 simulations)' \
+  --output-dir tvbgpu/output
+```
+
+Add `--expected-small-checkpoint NAME_OR_ABSOLUTE_PATH` to assert the workshop
+checkpoint's identity too. A basename checks the recorded filename; a path checks
+its exact recorded path. Without these assertions the script reports distinct
+recorded checkpoint paths, but cannot determine whether the supplied runs were
+assigned the intended small/full roles. Change the directory arguments to match
+your project layout. `--output-dir` must exist and defaults to the current directory.
+Repeated comparisons overwrite the three comparison files below.
+
+Validation requires finite `(N, 7)` draws, `N == num_samples`, canonical identical
+parameter ordering, matching priors, the same recorded EEG path and epoch/channel/
+sampling metadata, and compatible feature/preprocessing configuration. Each run's
+feature names, dimensions and mask must be internally consistent. Masks may differ
+between models. PCA bases and normalization statistics are model-specific and are
+not reapplied to posterior draws. Missing or incompatible required metadata fails
+before comparison outputs are written. Different sample counts are allowed.
+
+Outputs:
+
+- `posterior_comparison.csv`: seven rows containing each model's median, equal-tailed
+  50% and 95% intervals, normalized positions, raw/normalized 95% widths, the
+  small/full 95%-width ratio, and signed/absolute normalized median displacement.
+- `posterior_comparison.png`: forest plot on a shared 0–1 prior-position axis;
+  dots are medians, thick lines are 50% intervals, thin lines are 95% intervals.
+- `posterior_comparison_metadata.json`: both original metadata records, sample
+  shapes, verification results, labels, and metric definitions.
+
+Normalized position is `(value - prior_low) / (prior_high - prior_low)`.
+Normalized median displacement is `(small_median - full_median) / prior_width`.
+Width is `q97.5 - q2.5`. A zero full-model width gives an undefined ratio (blank CSV
+cell), not an arbitrary finite value. Noise remains in the inferred `log10_weight_noise`
+coordinate throughout; the seven parameters are never mixed with derived physical-noise
+summaries. Narrower intervals are not evidence of greater accuracy or calibration.
+
+Existing inference metadata records paths, not content hashes or the training
+simulation count. Therefore the comparison verifies recorded provenance, not
+immutable file identity, and “131072 simulations” is a user-supplied plot label.
+The original observation label (including an approximate-selection demo warning)
+is carried into the plot.
