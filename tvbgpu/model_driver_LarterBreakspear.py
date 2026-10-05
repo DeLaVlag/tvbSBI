@@ -46,11 +46,11 @@ class Driver_Setup:
 
     def get_logger_o(self, loggername, log_file='default.log'):
         logger = logging.getLogger(loggername)
-        logger.setLevel(logging.DEBUG)
+        logger.setLevel(logging.INFO)
 
         # File handler
         file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.DEBUG)
+        file_handler.setLevel(logging.INFO)
 
         # Formatter
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')

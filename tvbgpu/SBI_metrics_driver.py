@@ -84,7 +84,7 @@ data_root = os.path.dirname(os.path.realpath(__file__)) + '/data/'
 
 def get_logger_o(loggername):
     logger = logging.getLogger(loggername)
-    # logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
 
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -92,7 +92,7 @@ def get_logger_o(loggername):
     if not logger.hasHandlers():
         # Stream handler to stdout (will go to SLURM .out file)
         stream_handler = logging.StreamHandler(sys.stdout)
-        stream_handler.setLevel(logging.DEBUG)
+        stream_handler.setLevel(logging.INFO)
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
@@ -100,8 +100,7 @@ def get_logger_o(loggername):
 
 
 logger = get_logger_o('tvb.SBI')
-# logger.setLevel(level='INFO' if True else 'WARNING')
-logger.setLevel(level='INFO' if True else 'WARNING')
+logger.setLevel(logging.INFO)
 if my_rank == 0:
     logger.info('Starting logger for rank 0')
     logger.info('MPI World Size %d', world_size)
@@ -946,5 +945,4 @@ def runmain():
 
 if __name__ == '__main__':
     runmain()
-
 

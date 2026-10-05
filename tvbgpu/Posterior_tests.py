@@ -17,10 +17,9 @@ from tvbgpu import SBI_metrics_driver
 from tvbgpu.model_driver_LarterBreakspear import Driver_Setup, Driver_Execute
 
 comm = MPI.COMM_WORLD
-# logger.setLevel(level='INFO' if True else 'WARNING')
 
 logger = logging.getLogger('check.Posterior')
-logger.setLevel(level='DEBUG' if True else 'WARNING')
+logger.setLevel(logging.INFO)
 
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -28,7 +27,7 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 if not logger.hasHandlers():
     # Stream handler to stdout (will go to SLURM .out file)
     stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.DEBUG)
+    stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
