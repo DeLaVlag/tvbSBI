@@ -98,7 +98,7 @@ class Driver_Setup:
 
         # bufferlength is based on the minimum of the first swept parameter (speed for many tvb models)
         self.n_work_items, self.n_params = self.params.shape
-        self.buf_len_ = ((self.lengths / self.args.conduct_speed / self.dt).astype('i').max() + 1)
+        self.buf_len_ = ((self.lengths / self.args.conduct_speed / self.dt + .5).astype('i').max() + 1)
         self.buf_len = 2 ** np.argwhere(2 ** np.r_[:30] > self.buf_len_)[0][0]  # use next power of
 
         self.states = self.args.states
@@ -221,7 +221,7 @@ class Driver_Setup:
                             action='store_true')
         parser.add_argument('-g', '--gpu_info', default=False, help="show gpu info", action='store_true')
         parser.add_argument('-dt', '--delta_time', default=0.1, type=float, help="dt for simulation")
-        parser.add_argument('-cs', '--conduct_speed', default=3, type=float,
+        parser.add_argument('-cs', '--conduct_speed', default=1, type=float,
                             help="set conduction speed for temporal buffer")
         parser.add_argument('--procid', default="0", type=int, help="Number of L2L processes(Only when in L2L)")
         parser.add_argument('-gs', '--FCSC', default=True, help="Structure to Function", action='store_true')

@@ -47,7 +47,8 @@ void compute_derivatives(
     float ZT, float d_Z,
     float QV_max, float QZ_max,
     float t_scale,
-    float rNMDA
+    float rNMDA,
+    float phi
 )
 {
     float arg;
@@ -80,7 +81,7 @@ void compute_derivatives(
         + ane * Iext
     );
 
-    dWx = t_scale * (aei * (m_K - Wx)) / tau_K;
+    dWx = t_scale * (phi * (m_K - Wx)) / tau_K;
 
     dZx = t_scale * b * (ani * Iext + aei * Vx * QV);
 }
@@ -147,7 +148,9 @@ __global__ void larter_breakspear(
     float etaV = 0;
     const float tau_eta = 0.05f;
     const float sigma_eta = sqrt(nsig);
-    const float theta = 1.0f / tau_eta;
+
+    const float ou_decay = expf(-dt / tau_eta);
+    const float ou_scale = sigma_eta * sqrtf(1.0f - ou_decay * ou_decay);
 
     for (unsigned int i_node = 0; i_node < n_node; i_node++) {
         tavg(i_node) = 0.0f;
@@ -178,11 +181,16 @@ __global__ void larter_breakspear(
                 int dij_i = (int)(lengths[i_n+j_node]*rec_speed_dt + 0.5f);
                 if (dij_i >= nh) dij_i = nh-1;
                 float V_j = state((t-dij_i+nh)%nh, j_node + 0*n_node);
-                c_pop0 += wij*V_j;
+
+                float arg_j = (V_j - VT) / d_V;
+                arg_j = fminf(fmaxf(arg_j, -20.0f), 20.0f);
+                float QV_j = 0.5f * QV_max * (1.0f + tanhf(arg_j));
+
+                c_pop0 += wij*QV_j;
             }
             c_pop0 *= global_coupling;
 
-            etaV += dt * (-theta*etaV) + sqrtf(2.0f*theta*dt)*sigma_eta*curand_normal(&crndst);
+            etaV = ou_decay * etaV + ou_scale * curand_normal(&crndst);
 
             /* ------------------- HEUN ------------------- */
             if (heun_integrated==1) {
@@ -190,7 +198,7 @@ __global__ void larter_breakspear(
 
                 compute_derivatives(V,W,Z,c_pop0,k1V,k1W,k1Z,
                     tau_K, gCa,gK,gL,gNa,TK,TCa,TNa,VCa,VK,VL,VNa,d_K,d_Na,d_Ca,
-                    aei,aie,b,C,ane,ani,aee,Iext,VT,d_V,ZT,d_Z,QV_max,QZ_max,t_scale,rNMDA);
+                    aei,aie,b,C,ane,ani,aee,Iext,VT,d_V,ZT,d_Z,QV_max,QZ_max,t_scale,rNMDA, phi);
 
                 float Vtmp=V + dt*k1V;
                 float Wtmp=W + dt*k1W;
@@ -198,7 +206,7 @@ __global__ void larter_breakspear(
 
                 compute_derivatives(Vtmp,Wtmp,Ztmp,c_pop0,k2V,k2W,k2Z,
                     tau_K, gCa,gK,gL,gNa,TK,TCa,TNa,VCa,VK,VL,VNa,d_K,d_Na,d_Ca,
-                    aei,aie,b,C,ane,ani,aee,Iext,VT,d_V,ZT,d_Z,QV_max,QZ_max,t_scale,rNMDA);
+                    aei,aie,b,C,ane,ani,aee,Iext,VT,d_V,ZT,d_Z,QV_max,QZ_max,t_scale,rNMDA, phi);
 
                 V = fmaf(0.5f*dt, k1V+k2V, V) + etaV;
                 W = fmaf(0.5f*dt, k1W+k2W, W);
@@ -214,7 +222,7 @@ __global__ void larter_breakspear(
                 float k1V,k1W,k1Z;
                 compute_derivatives(V,W,Z,c_pop0,k1V,k1W,k1Z,
                     tau_K, gCa,gK,gL,gNa,TK,TCa,TNa,VCa,VK,VL,VNa,d_K,d_Na,d_Ca,
-                    aei,aie,b,C,ane,ani,aee,Iext,VT,d_V,ZT,d_Z,QV_max,QZ_max,t_scale,rNMDA);
+                    aei,aie,b,C,ane,ani,aee,Iext,VT,d_V,ZT,d_Z,QV_max,QZ_max,t_scale,rNMDA, phi);
 
                 V += dt*k1V + etaV;
                 W += dt*k1W;
